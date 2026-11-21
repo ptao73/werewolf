@@ -480,6 +480,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, {"games": b["games"], "points": stats.POINTS, "labels": stats.LABELS,
                                     "rows": [{k: r[k] for k in ("name", "human", "games", "wins", "win_rate",
                                                                 "judge", "total", "avg", "detail")} for r in b["rows"]]})
+        if u.path == "/api/rules":             # 规则说明（和 AI 拿到的规则是同一份）
+            import stats
+            return self.reply(200, {"sizes": {n: w.rules_text(n) for n in SIZES},
+                                    "roles": {n: w.ROLESETS[n] for n in SIZES},
+                                    "turn_seconds": TURN_SECONDS, "points": stats.POINTS, "labels": stats.LABELS})
         if u.path == "/api/state":
             q = parse_qs(u.query)
             try:

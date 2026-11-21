@@ -239,6 +239,7 @@ async function tickOnce() {
 
   const st = s.room.state;
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
+  updateStartBtn(s);
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
   const key = JSON.stringify([st, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
@@ -273,7 +274,7 @@ const board = document.getElementById("board");
 document.getElementById("boardBtn").onclick = async () => {
   board.textContent = "";
   board.hidden = false;
-  const close = el("button", { class: "primary", onclick: () => (board.hidden = true) }, "关闭");
+  const close = el("button", { class: "primary", onclick: () => (board.hidden = true) }, "← 回到游戏");
   board.appendChild(row(close));
   let b;
   try { b = await (await fetch("/api/leaderboard")).json(); }
@@ -293,4 +294,68 @@ document.getElementById("boardBtn").onclick = async () => {
   board.appendChild(t);
   const rules = Object.entries(b.points).map(([k, v]) => `${b.labels[k]} ${v > 0 ? "+" : ""}${v}`).join("，");
   board.appendChild(el("div", { class: "rules" }, "计分：胜利 +10；" + rules + "。只统计打完的真实对局。"));
+};
+
+// ---------- 顶部按钮：大厅（回到游戏）、开局、规则 ----------
+const overlay = board;
+statusEl.onclick = () => { overlay.hidden = true; };     // 不管在看排行榜还是规则，点它就回到游戏
+
+const startBtn = document.getElementById("startBtn");
+let startAction = null;
+function updateStartBtn(s) {
+  // 开局按钮：没房间→建房并开局；房主→开局；没加入→加入；其他情况变灰
+  const st = s.room.state, me = s.me;
+  startAction = null;
+  let label = "▶ 开局", tip = "";
+  if (st === "idle") startAction = "create";
+  else if (st === "lobby" && me.host) startAction = "start";
+  else if (st === "lobby" && !me.member) { startAction = "join"; label = "▶ 加入"; }
+  else if (st === "lobby") tip = "只有房主可以开局";
+  else tip = "游戏进行中";
+  startBtn.textContent = label;
+  startBtn.disabled = !startAction;
+  startBtn.title = tip;
+}
+startBtn.onclick = async () => {
+  overlay.hidden = true;
+  let nick = (localStorage.getItem("nick") || "").trim();
+  if (startAction !== "start" && !nick) {
+    nick = (prompt("你的昵称（最多 12 个字）") || "").trim().slice(0, 12);
+    if (!nick) return;
+    localStorage.setItem("nick", nick);
+  }
+  startBtn.disabled = true;
+  try {
+    if (startAction === "create") {
+      await post("/api/room/create", { nick, size: 6 });
+      await post("/api/room/start");
+    } else if (startAction === "start") {
+      await post("/api/room/start");
+    } else if (startAction === "join") {
+      await post("/api/room/join", { nick });
+    }
+  } catch (e) { alert("开局失败：" + e.message); }
+  panelKey = ""; await tick();
+};
+
+document.getElementById("rulesBtn").onclick = async () => {
+  overlay.textContent = "";
+  overlay.hidden = false;
+  overlay.appendChild(row(el("button", { class: "primary", onclick: () => (overlay.hidden = true) }, "← 回到游戏")));
+  let r;
+  try { r = await (await fetch("/api/rules")).json(); }
+  catch (e) { overlay.appendChild(el("div", { class: "err" }, "读取失败：" + e.message)); return; }
+  overlay.appendChild(el("h2", {}, "📖 规则说明"));
+  overlay.appendChild(el("div", { class: "rtext" },
+    "· 每局由房主选人数；空位由 AI 补上。游戏中大家都只显示座位号，结束后公布每个座位是谁、是什么身份。\n" +
+    "· 夜里：守卫、狼人、预言家同时行动，然后女巫行动。白天：公布死讯 → 依次发言 → 所有人同时投票。\n" +
+    `· 真人每次行动限时 ${r.turn_seconds} 秒，超时自动处理：发言记为“过”，投票记为弃票，必须选人的随机选。\n` +
+    "· 结束后可以在下方“赛后问 AI”里问 AI 当时是怎么想的。"));
+  for (const [n, text] of Object.entries(r.sizes)) {
+    overlay.appendChild(el("h3", {}, `${n} 人局`));
+    overlay.appendChild(el("div", { class: "rtext" }, text.split("\n").slice(1, -1).join("\n")));
+  }
+  overlay.appendChild(el("h3", {}, "🏆 积分"));
+  const pts = Object.entries(r.points).map(([k, v]) => `${r.labels[k]} ${v > 0 ? "+" : ""}${v}`).join("，");
+  overlay.appendChild(el("div", { class: "rtext" }, "胜利 +10；" + pts + "。只统计打完的真实对局。"));
 };

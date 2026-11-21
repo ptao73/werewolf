@@ -41,8 +41,15 @@
   .countdown { color:var(--accent); font-size:13px; font-weight:400; margin-left:6px; }
   .members { margin:4px 0 6px; }
   hr { border:0; border-top:1px solid #2a2e37; margin:10px 0; }
-  #boardBtn { padding:5px 10px; font-size:14px; }
-  #board { position:fixed; inset:0; z-index:5; background:rgba(10,11,14,.97); overflow:auto; padding:14px; }
+  header { gap:6px !important; }
+  .hbtn { padding:5px 8px; font-size:13px; white-space:nowrap; }
+  #status { color:var(--dim); }
+  @media (max-width: 420px) { header .title { display:none; } }   /* 窄屏只显示 🐺 */
+  #board h3 { margin:14px 0 4px; color:var(--accent); }
+  #board .rtext { white-space:pre-wrap; font-size:14px; line-height:1.6; }
+  /* 排行榜/规则页盖住消息区，但不盖住顶部按钮栏（随时能点"大厅"回来） */
+  header { position:relative; z-index:10; background:var(--bg); }
+  #board { position:fixed; inset:0; padding-top:64px !important; z-index:5; background:rgba(10,11,14,.97); overflow:auto; padding:14px; }
   #board table { border-collapse:collapse; width:100%; font-size:14px; }
   #board th, #board td { padding:6px 5px; border-bottom:1px solid #2a2e37; text-align:right; white-space:nowrap; }
   #board th:nth-child(2), #board td:nth-child(2) { text-align:left; }
@@ -57,7 +64,7 @@
 </style>
 </head>
 <body>
-<header><h1>🐺 狼人杀</h1><button id="boardBtn">🏆 排行榜</button><span id="status">连接中…</span></header>
+<header><h1>🐺<span class="title"> 狼人杀</span></h1><button id="boardBtn" class="hbtn">🏆 排行榜</button><button id="rulesBtn" class="hbtn">📖 规则</button><button id="startBtn" class="hbtn primary">▶ 开局</button><button id="status" class="hbtn">连接中…</button></header>
 <div id="board" hidden></div>
 <main id="log"></main>
 <section id="panel"></section>
