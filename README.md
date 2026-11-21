@@ -22,6 +22,7 @@ python3 werewolf.py --auto                             # all-AI game
 ```
 - Before each game, the drawn models are checked; any that are out of quota or failing
   are reported (`⚠️ … 不可用`) and replaced by another draw.
+- After each game: `n` next game (models re-drawn and re-checked), `q` quit.
 - If a model fails mid-game: `r` retry, `s` hand its seat (same role and memory) to a spare model, `q` quit.
 - Lines marked 🔒 are private to you. Full game records (incl. secrets) go to `logs/`.
 - Edit `MODEL_POOL` at the top of `werewolf.py` to add or remove models.

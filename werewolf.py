@@ -445,6 +445,20 @@ if __name__ == "__main__":
     wanted = find_models([n.strip() for n in a.players.split(",") if n.strip()])
     if len(wanted) > need:
         sys.exit(f"最多指定 {need} 个模型。")
-    chosen, spare = pick_players(wanted, need, a.fake)
-    entries = chosen if a.auto else chosen + [HUMAN]
-    Game(entries, spare, fake=a.fake, auto=a.auto).run()
+    while True:
+        # 每局都重新抽取、重新检查模型（额度可能刚恢复或刚用完）
+        chosen, spare = pick_players(wanted, need, a.fake)
+        entries = chosen if a.auto else chosen + [HUMAN]
+        Game(entries, spare, fake=a.fake, auto=a.auto).run()
+        if a.auto:          # 全自动测试模式：只玩一局
+            break
+        restore_tty()
+        try:
+            while (c := clean_input(input("\n🔁 n=下一局  q=结束：")).strip().lower()) not in ("n", "q"):
+                print("   请输入 n 或 q。")
+        except (KeyboardInterrupt, EOFError):
+            c = "q"
+        if c == "q":
+            print("👋 再见！")
+            break
+        print("\n" + "=" * 40 + "\n")
