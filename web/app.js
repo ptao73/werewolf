@@ -18,6 +18,7 @@ window.addEventListener("resize", fitViewport);
 window.addEventListener("orientationchange", fitViewport);
 document.addEventListener("focusout", () => setTimeout(fitViewport, 50));   // 键盘收起
 fitViewport();      // 我的座位和身份（用来在座位表里标蓝）
+let gameEvents = [], lastSeatsKey = "", lastNotice = null;
 let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0, draftQ = "", draftSeat = "0";
 
 function el(tag, attrs = {}, text) {
@@ -67,7 +68,10 @@ function addSeats(ev) {
 }
 
 function addEvent(ev) {
-  if (ev.kind === "seats" && ev.data) return addSeats(ev);
+  if (ev.kind === "seats" && ev.data) {   // 座位改到顶部固定栏；对话里只留"开始"那一行
+    if (ev.data.title.includes("开始")) log.appendChild(el("div", { class: "ev public" }, ev.data.title.replace("座位：", "")));
+    return;
+  }
   let cls = ev.kind;
   if (ev.text.includes("===== 第") && ev.text.includes("夜")) cls += " night";
   if (ev.text.includes("===== 第") && ev.text.includes("天 =====")) cls += " day";
@@ -242,7 +246,7 @@ async function tickOnce() {
   }
   if (s.game !== game) {                 // 新的一局（或刚打开页面）：清空后从头显示
     const firstLoad = game === -1;
-    game = s.game; log.textContent = ""; shown = 0; panelKey = ""; follow = true;
+    game = s.game; log.textContent = ""; shown = 0; panelKey = ""; follow = true; gameEvents = [];
     if (!firstLoad) { tickAgain = true; return; }
   }
   // 服务器更新了网页：不在你的回合时自动刷新，换上新版本
@@ -251,6 +255,7 @@ async function tickOnce() {
   meSeat = s.me.seat; meRole = s.me.role;
   for (const ev of s.events) {
     if (ev.i < shown) continue;          // 已经显示过的消息不再重复显示
+    gameEvents.push(ev);
     addEvent(ev); shown = ev.i + 1;
   }
   if (s.events.length === 0 && s.total > shown && !s.me.in_game) shown = s.total;  // 看不到的消息直接跳过
@@ -259,19 +264,22 @@ async function tickOnce() {
   const st = s.room.state;
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
   updateStartBtn(s);
+  renderSeatbar(s.seats || []);
+  if (s.notice) lastNotice = s.notice;
   document.getElementById("adminBtn").hidden = !s.me.owner;
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
-  const key = JSON.stringify([st, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
+  if (s.notice) panelKey = "";            // 有新提示时重画面板
+  const key = JSON.stringify([st, lastNotice, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
                              s.discuss.available, s.discuss.busy]);
   if (key !== panelKey) {
     panelKey = key;
     panel.textContent = "";
     countdownEl = null;
     if (s.pending) renderTurn(s.pending);
-    else if (st === "idle") renderIdle(s);
+    else if (st === "idle") { if (lastNotice) panel.appendChild(el("div", { class: "notice" }, "ℹ️ " + lastNotice)); renderIdle(s); }
     else if (st === "lobby") renderLobby(s);
-    else if (s.me.in_game) renderWaiting(s);
+    else if (s.me.in_game) { lastNotice = null; renderWaiting(s); }
     else panel.appendChild(el("div", { class: "task" }, "游戏进行中，你没有参加这一局，请等待下一局。"));
     if (s.pending) follow = true;        // 轮到你时总是跳到最新
     toBottom();                          // 操作区高度变了，消息区也要重新贴底
@@ -414,6 +422,18 @@ document.getElementById("adminBtn").onclick = async () => {
     await post("/api/admin/code"); document.getElementById("adminBtn").click();
   })), err);
   overlay.appendChild(el("h3", {}, `今天朋友开局：${a.used_today} / ${a.limit}（你自己开的不算）`));
+  overlay.appendChild(el("h3", {}, `房间（${a.rooms.length}）`));
+  if (!a.rooms.length) overlay.appendChild(el("div", { class: "rtext" }, "现在没有房间。"));
+  for (const r of a.rooms) {
+    const st = r.state === "running" ? "游戏中" : "等人中";
+    const line = el("div", { class: "line" });
+    line.appendChild(el("span", { class: "grow" }, `#${r.id} · ${r.size}人局 · ${st} · 👥 ${r.names.join("、")} · ${Math.floor(r.idle / 60)} 分钟前有活动`));
+    line.appendChild(action(el("button", { class: "danger" }, "删除"), err, async () => {
+      if (!confirm(`删除 #${r.id} 房间？` + (r.state === "running" ? "正在进行的这局会被结束。" : ""))) throw new Error("已取消");
+      await post("/api/admin/close_room", { room: r.id }); document.getElementById("adminBtn").click();
+    }));
+    overlay.appendChild(line);
+  }
   overlay.appendChild(el("h3", {}, `已加入的朋友（${a.allowed.length}）`));
   for (const p of a.allowed) {
     const line = el("div", { class: "line" });
@@ -425,3 +445,30 @@ document.getElementById("adminBtn").onclick = async () => {
     overlay.appendChild(line);
   }
 };
+
+// ---------- 顶部固定座位栏：点座位看他这局说过的话 ----------
+const seatbar = document.getElementById("seatbar");
+function renderSeatbar(seats) {
+  const key = JSON.stringify([seats, meSeat, meRole]);
+  if (key === lastSeatsKey) return;
+  lastSeatsKey = key;
+  seatbar.textContent = "";
+  seatbar.hidden = !seats.length;
+  for (const x of seats) {
+    let cls = "", txt = x.seat + "号";
+    if (x.seat === meSeat) { cls += " me"; txt += "（你" + (meRole ? "·" + meRole : "") + "）"; }
+    if (!x.alive) cls += " dead";
+    seatbar.appendChild(el("button", { class: cls.trim(), onclick: () => showSeat(x.seat) }, txt));
+  }
+}
+function showSeat(n) {
+  // 找出这个座位的发言、遗言、赛后回答（消息里以"💬 N号"或"🤖 N号"开头的行）
+  const re = new RegExp("^(💬|🤖) " + n + "号[ （：]");
+  const lines = gameEvents.map(e => e.text.replace(/^\n+/, "")).filter(t => re.test(t));
+  overlay.textContent = "";
+  overlay.hidden = false;
+  overlay.appendChild(row(el("button", { class: "primary", onclick: () => (overlay.hidden = true) }, "← 回到游戏")));
+  overlay.appendChild(el("h2", {}, `${n}号 这局说过的话（${lines.length}）`));
+  if (!lines.length) overlay.appendChild(el("div", { class: "rtext" }, "还没有发言。"));
+  for (const t of lines) overlay.appendChild(el("div", { class: "ev public" }, t));
+}

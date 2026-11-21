@@ -325,6 +325,22 @@ class Room:
         self.last_game = None          # 刚结束的那一局（赛后讨论用）
         self.current_game = None       # 正在进行（或刚结束）的一局
         self.asking = False            # 赛后讨论：同一时间只问一个问题
+        self.last_action = time.time() # 最后一次有人操作（加入、开局、回答、提问…）
+        self.last_seen = {host: time.time()}   # uid → 这个人的页面最后一次来问状态的时间
+
+    def touch(self):
+        self.last_action = time.time()
+
+    def seats(self):
+        """顶部座位栏：每个座位是否还活着（公开信息）"""
+        g = self.current_game
+        return [{"seat": p["seat"], "alive": p["alive"]} for p in g.players] if g else []
+
+    def close(self):
+        """房间被删除：如果在游戏中就结束本局"""
+        with self.cond:
+            self.state, self.stop_flag = "closed", True
+            self.cond.notify_all()
 
     # ----- 游戏线程用 -----
     def add(self, text, kind, to=None, data=None):
@@ -353,6 +369,7 @@ class Room:
 
     # ----- 网页请求用 -----
     def give_answer(self, uid, data):
+        self.touch()
         with self.cond:
             p = self.pending.get(uid)
             if not p or data.get("id") != p["id"]:
@@ -366,6 +383,7 @@ class Room:
             return None
 
     def join(self, uid, nick):
+        self.touch()
         with self.cond:
             if self.state != "lobby":
                 return "这个房间正在游戏中或已解散，现在不能加入"
@@ -391,6 +409,7 @@ class Room:
             return None, False, []
 
     def set_size(self, uid, size):
+        self.touch()
         with self.cond:
             if uid != self.host or self.state != "lobby":
                 return "只有房主可以改人数"
@@ -402,6 +421,7 @@ class Room:
             return None
 
     def start(self, uid):
+        self.touch()
         with self.cond:
             if uid != self.host or self.state != "lobby":
                 return "只有房主可以开始游戏"
@@ -449,6 +469,7 @@ class Room:
             with self.cond:
                 if self.state == "running":
                     self.state = "lobby"
+                self.last_action = time.time()
                 self.pending, self.stop_flag = {}, False
                 self.cond.notify_all()
             MODELS.prewarm()                   # 为下一局提前检查
@@ -456,6 +477,7 @@ class Room:
     def discuss(self, uid, seat, question):
         """赛后讨论：房间里的人问某位 AI（seat=0 表示问所有 AI）"""
         question = w.clean_input(str(question or "")).strip()[:200]
+        self.touch()
         with self.cond:
             g = self.last_game
             if self.state != "lobby" or not g or uid not in self.members:
@@ -501,15 +523,20 @@ class Room:
             self.cond.notify_all()
             return None
 
-    def summary(self):
-        """房间列表里显示的信息"""
+    def summary(self, detail=False):
+        """房间列表里显示的信息（detail=True 给管理页用）"""
         with self.cond:
-            return {"id": self.id, "size": self.size, "host": self.members.get(self.host),
-                    "members": len(self.members), "state": self.state}
+            d = {"id": self.id, "size": self.size, "host": self.members.get(self.host),
+                 "members": len(self.members), "state": self.state}
+            if detail:
+                d["names"] = list(self.members.values())
+                d["idle"] = int(time.time() - self.last_action)
+            return d
 
     def view(self, uid, since):
         """某位玩家能看到的状态：公开消息 + 只发给他的消息"""
         with self.cond:
+            self.last_seen[uid] = time.time()
             member = uid in self.members
             in_game = uid in self.players
             show = in_game or (self.state != "running" and member)
@@ -533,6 +560,7 @@ class Room:
                          "host": self.members.get(self.host), "members": list(self.members.values()),
                          "ai": max(0, self.size - len(self.members)), "ai_ready": MODELS.ready()},
                 "v": VERSION, "game": self.game_no, "pending": pend, "events": evs, "total": len(self.events),
+                "seats": self.seats() if show else [],
             }
 
 
@@ -545,6 +573,49 @@ class Hub:
         self.rooms = {}        # 房间号 → Room
         self.where = {}        # uid → 房间号
         self.next_rid = 1
+        self.notices = {}      # uid → 一条提示（例如"房间因 5 分钟没有活动已关闭"），显示一次
+        threading.Thread(target=self.janitor, daemon=True).start()
+
+    IDLE_SECONDS = 5 * 60      # 等人的房间：这么久没人操作就关闭
+    GONE_SECONDS = 3 * 60      # 等人的房间：所有人的页面都关了这么久就关闭（手机切到微信时页面会暂停，不能太短）
+
+    def janitor(self):
+        """每 10 秒检查一次：清理没人的房间、太久没活动的房间（游戏中的房间不动）"""
+        while True:
+            time.sleep(10)
+            now = time.time()
+            with self.lock:
+                rooms = list(self.rooms.values())
+            for r in rooms:
+                with r.cond:
+                    if r.state != "lobby":
+                        continue
+                    seen = [r.last_seen.get(u, 0) for u in r.members]
+                    gone = not seen or now - max(seen) > self.GONE_SECONDS
+                    idle = now - r.last_action > self.IDLE_SECONDS
+                if gone:
+                    self.remove_room(r.id, "房间里的人都离开了，房间已自动关闭")
+                elif idle:
+                    self.remove_room(r.id, "房间 5 分钟没有活动，已自动关闭")
+
+    def remove_room(self, rid, reason):
+        """删除房间：里面的人回到房间列表，并看到原因"""
+        with self.lock:
+            room = self.rooms.pop(rid, None)
+            if not room:
+                return "这个房间已经不存在"
+            for u, r_ in list(self.where.items()):
+                if r_ == rid:
+                    del self.where[u]
+                    self.notices[u] = f"#{rid} {reason}"
+        room.close()
+        print(f"[房间] #{rid} 已删除：{reason}", file=sys.stderr, flush=True)
+        return None
+
+    def admin_rooms(self):
+        with self.lock:
+            rooms = list(self.rooms.values())
+        return [r.summary(detail=True) for r in rooms]
 
     def room_of(self, uid):
         with self.lock:
@@ -579,6 +650,7 @@ class Hub:
             err = room.join(uid, nick)
             if not err:
                 self.where[uid] = rid
+                room.last_seen[uid] = time.time()
             return err
 
     def leave(self, uid):
@@ -615,8 +687,10 @@ class Hub:
                         "owner": bool(ACL.is_owner(uid))},
                  "room": {"id": None, "state": "idle", "size": 6, "sizes": SIZES, "host": None, "members": [],
                           "ai": 0, "ai_ready": MODELS.ready()},
-                 "v": VERSION, "game": 0, "pending": None, "events": [], "total": 0}
+                 "v": VERSION, "game": 0, "pending": None, "events": [], "total": 0, "seats": []}
         v["rooms"] = [r.summary() for r in rooms]
+        with self.lock:
+            v["notice"] = self.notices.pop(uid, None)
         v["max_rooms"] = self.MAX_ROOMS
         return v
 
@@ -676,7 +750,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/admin":
             if not ACL.is_owner(uid):
                 return self.reply(403, {"error": "只有网站主人可以看"})
-            return self.reply(200, ACL.admin_view())
+            return self.reply(200, dict(ACL.admin_view(), rooms=HUB.admin_rooms()))
         if u.path == "/api/leaderboard":       # 积分榜（真人只显示昵称，不显示邮箱）
             import stats
             b = stats.leaderboard()
@@ -717,10 +791,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400 if err else 200, {"error": err} if err else {"ok": True})
         if not ACL.allowed(uid):                        # 没放行的人不能做别的
             return self.reply(403, {"error": "需要邀请码", "need_invite": True})
-        if path in ("/api/admin/code", "/api/admin/remove"):   # 只有你能用的管理操作
+        if path in ("/api/admin/code", "/api/admin/remove", "/api/admin/close_room"):   # 只有你能用的管理操作
             if not ACL.is_owner(uid):
                 return self.reply(403, {"error": "只有网站主人可以操作"})
-            err = ACL.change_code() if path == "/api/admin/code" else ACL.remove(str(data.get("email", "")))
+            if path == "/api/admin/code":
+                err = ACL.change_code()
+            elif path == "/api/admin/remove":
+                err = ACL.remove(str(data.get("email", "")))
+            else:
+                err = HUB.remove_room(data.get("room"), "房间已被网站主人删除")
             return self.reply(400 if err else 200, {"error": err} if err else {"ok": True})
         size = data.get("size")
         actions = {
@@ -744,6 +823,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if "--port" in sys.argv:        # 测试用：换端口
         PORT = int(sys.argv[sys.argv.index("--port") + 1])
+    if "--idle" in sys.argv:        # 测试用：缩短自动关闭房间的时间（秒）
+        Hub.IDLE_SECONDS = Hub.GONE_SECONDS = int(sys.argv[sys.argv.index("--idle") + 1])
     if "--turn" in sys.argv:        # 测试用：缩短真人时间限制
         TURN_SECONDS = int(sys.argv[sys.argv.index("--turn") + 1])
     print(f"狼人杀网页版：http://{HOST}:{PORT}  （公网：https://{PUBLIC_HOST}）", flush=True)

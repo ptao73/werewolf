@@ -59,12 +59,19 @@
   .seat { padding:2px 8px; border:1px solid #333845; border-radius:6px; }
   .seat.me { color:var(--priv); border-color:var(--priv); font-weight:600; }
   .seat.dead { color:var(--warn); border-color:#5a2f2b; text-decoration:line-through; }
+  /* 顶部固定座位栏：不随对话滚动；点座位看他的发言 */
+  #seatbar { flex:none; display:flex; flex-wrap:wrap; gap:5px; padding:6px 12px; border-bottom:1px solid #2a2e37; background:var(--bg); z-index:3; }
+  #seatbar button { padding:3px 8px; font-size:13px; border-radius:6px; }
+  #seatbar .me { color:var(--priv); border-color:var(--priv); font-weight:600; }
+  #seatbar .dead { color:var(--warn); border-color:#5a2f2b; text-decoration:line-through; }
+  .notice { color:var(--accent); margin-bottom:6px; font-size:14px; }
   .err { color:var(--warn); margin-top:4px; font-size:14px; }
   .err:empty { display:none; }
 </style>
 </head>
 <body>
 <header><h1>🐺<span class="title"> 狼人杀</span></h1><button id="boardBtn" class="hbtn">🏆 排行榜</button><button id="rulesBtn" class="hbtn">📖 规则</button><button id="startBtn" class="hbtn primary">▶ 开局</button><button id="adminBtn" class="hbtn" hidden>⚙</button><button id="status" class="hbtn">连接中…</button></header>
+<div id="seatbar" hidden></div>
 <div id="board" hidden></div>
 <main id="log"></main>
 <section id="panel"></section>
