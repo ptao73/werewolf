@@ -96,10 +96,11 @@ function sizeSelect(sizes, current) {
 
 // ---------- 轮到你 ----------
 function renderTurn(p) {
-  panel.appendChild(el("div", { class: "task" }, "👉 " + p.task));
-  countdownEl = el("div", { class: "countdown" });
+  const task = el("div", { class: "task" }, "👉 " + p.task);
+  countdownEl = el("span", { class: "countdown" });
   deadline = Date.now() + p.seconds_left * 1000;
-  panel.appendChild(countdownEl);
+  task.appendChild(countdownEl);
+  panel.appendChild(task);
   const err = errLine();
   let ta = null;
   if (p.speech) {
@@ -128,7 +129,6 @@ function renderTurn(p) {
 
 // ---------- 大厅 ----------
 function renderIdle(s) {
-  panel.appendChild(el("div", { class: "task" }, "还没有房间，创建一个吧"));
   const nick = nickInput(), size = sizeSelect(s.room.sizes, 6), err = errLine();
   const btn = action(el("button", { class: "primary" }, "创建房间"), err,
     () => post("/api/room/create", { nick: nick.value, size: Number(size.value) }));
@@ -138,31 +138,28 @@ function renderIdle(s) {
 // ---------- 赛后讨论 ----------
 function renderDiscuss(s) {
   const d = s.discuss, err = errLine();
-  panel.appendChild(el("div", { class: "task" }, "💬 赛后讨论：问问 AI 当时是怎么想的"));
   const sel = el("select");
   sel.appendChild(el("option", { value: "0" }, "所有 AI"));
   for (const x of d.seats) sel.appendChild(el("option", { value: String(x.seat) }, x.label));
   sel.value = draftSeat;
   sel.onchange = () => (draftSeat = sel.value);
-  const q = el("input", { type: "text", maxlength: "200", placeholder: "例：你为什么毒 3 号？" });
+  const q = el("input", { type: "text", maxlength: "200", placeholder: "💬 赛后问 AI：例 你为什么毒3号？" });
   q.value = draftQ;                      // 页面刷新时保留你打了一半的问题
   q.oninput = () => (draftQ = q.value);
-  const btn = el("button", { class: "primary" }, d.busy ? "回答中…" : "提问");
+  const btn = el("button", { class: "primary" }, d.busy ? "回答中…" : "问");
   btn.disabled = d.busy;
   action(btn, err, async () => {
     await post("/api/discuss", { seat: Number(sel.value), question: q.value });
     draftQ = "";
   });
-  panel.append(row(sel, q, btn), err, el("hr"));
+  panel.append(row(sel, q, btn), err);
 }
 
 function renderLobby(s) {
   const r = s.room, me = s.me, err = errLine();
   if (s.discuss.available) renderDiscuss(s);
-  panel.appendChild(el("div", { class: "task" },
-    `房间：${r.size} 人局 · 房主 ${r.host} · 已加入 ${r.members.length} 人，开始后由 ${r.ai} 个 AI 补位`));
-  panel.appendChild(el("div", { class: "members" }, "👥 " + r.members.join("、")));
-  if (r.ai > 0) panel.appendChild(el("div", { class: "info" }, r.ai_ready ? "🤖 AI 玩家已就绪，开局无需等待" : "🤖 正在后台准备 AI 玩家…"));
+  const ai = r.ai > 0 ? ` · 🤖${r.ai} ${r.ai_ready ? "✅" : "准备中…"}` : "";
+  panel.appendChild(el("div", { class: "line" }, `${r.size}人局 · 房主 ${r.host} · 👥 ${r.members.join("、")}${ai}`));
   if (!me.member) {
     const nick = nickInput();
     panel.append(row(nick, action(el("button", { class: "primary" }, "加入"), err,
@@ -175,27 +172,29 @@ function renderLobby(s) {
       try { await post("/api/room/size", { size: Number(size.value) }); panelKey = ""; await tick(); }
       catch (e) { err.textContent = e.message; size.value = String(r.size); }
     };
-    const start = action(el("button", { class: "primary" }, s.discuss.available ? "🔁 开始下一局" : "开始游戏"), err,
+    const start = action(el("button", { class: "primary" }, s.discuss.available ? "🔁 下一局" : "开始游戏"), err,
       () => post("/api/room/start"));
-    const leave = action(el("button", { class: "danger" }, "解散房间"), err, () => post("/api/room/leave"));
+    const leave = action(el("button", { class: "danger" }, "解散"), err, () => post("/api/room/leave"));
     panel.append(row(size, start, leave), err);
   } else {
-    panel.appendChild(el("div", { class: "info" }, "等待房主开始…"));
-    panel.append(row(action(el("button", { class: "danger" }, "离开房间"), err, () => post("/api/room/leave"))), err);
+    panel.append(row(el("span", { class: "info grow" }, "等待房主开始…"),
+      action(el("button", { class: "danger" }, "离开"), err, () => post("/api/room/leave"))), err);
   }
 }
 
 function renderWaiting(s) {
-  panel.appendChild(el("div", { class: "task" }, "⏳ 等待其他玩家…"));
+  const line = el("div", { class: "line" });
+  line.appendChild(el("span", { class: "grow" }, "⏳ 等待其他玩家…"));
+  const err = errLine();
   if (s.me.host) {
-    const err = errLine();
     const stop = el("button", { class: "danger" }, "结束本局");
     stop.onclick = async () => {
       if (!confirm("确定要结束这一局吗？")) return;
       try { await post("/api/stop"); } catch (e) { err.textContent = e.message; }
     };
-    panel.append(row(stop), err);
+    line.appendChild(stop);
   }
+  panel.append(line, err);
 }
 
 // ---------- 主循环 ----------
@@ -262,7 +261,7 @@ async function tickOnce() {
 setInterval(() => {
   if (countdownEl) {
     const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-    countdownEl.textContent = `⏱ 剩余 ${left} 秒` + (left === 0 ? "（已超时，系统自动处理）" : "");
+    countdownEl.textContent = left > 0 ? `⏱${left}s` : "⏱ 已超时";
   }
 }, 1000);
 
