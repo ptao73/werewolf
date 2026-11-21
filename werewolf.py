@@ -6,7 +6,7 @@
 看模型池：  python3 werewolf.py --list
 测试：      python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，不花额度）
 """
-import json, random, re, subprocess, sys, tempfile, time, argparse, termios
+import json, random, re, subprocess, sys, tempfile, time, argparse, termios, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -76,7 +76,7 @@ class Game:
         return p["kind"] == "human"
 
     def log(self, text):
-        with open(self.logfile, "a") as f:
+        with open(self.logfile, "a", errors="replace") as f:   # 万一有怪字符也不崩溃
             f.write(text + "\n")
 
     def say(self, text):
@@ -108,15 +108,17 @@ class Game:
         print(f"\n👉 {task}")
         text = ""
         if speech:
-            text = input("你的发言（直接回车=过）：").strip() or "过。"
+            text = clean_input(input("你的发言（直接回车=过）：")).strip() or "过。"
         if not choices:
             return text, 0
         print("   可选：" + "  ".join(self.label(c) for c in choices) + ("  0=不选" if allow_none else ""))
         valid = [c["seat"] for c in choices] + ([0] if allow_none else [])
         while True:
-            s = input("输入座位号：").strip()
-            if s.isdigit() and int(s) in valid:
-                return text, int(s)
+            # 接受 "3"、"3号"、全角 "３" 等写法：只取里面的数字
+            s = unicodedata.normalize("NFKC", clean_input(input("输入座位号：")))
+            digits = re.findall(r"\d+", s)
+            if len(digits) == 1 and int(digits[0]) in valid:
+                return text, int(digits[0])
             print("   无效，请重新输入。")
 
     def ask_ai(self, p, task, valid, allow_none, speech):
@@ -342,9 +344,19 @@ class Game:
 TTY_SAVED = termios.tcgetattr(0) if sys.stdin.isatty() else None
 
 
+IUTF8 = getattr(termios, "IUTF8", 0o040000)  # 部分 Python 版本没有这个常量，Linux 上的值固定是 0o040000
+
+
 def restore_tty():
     if TTY_SAVED is not None:
-        termios.tcsetattr(0, termios.TCSADRAIN, TTY_SAVED)
+        attrs = [list(a) if isinstance(a, list) else a for a in TTY_SAVED]
+        attrs[0] |= IUTF8   # 打开 UTF-8 编辑：退格一次删掉整个汉字，而不是半个
+        termios.tcsetattr(0, termios.TCSADRAIN, attrs)
+
+
+def clean_input(text):
+    """去掉输入里残缺的字节（例如退格只删了半个汉字），避免程序崩溃"""
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "ignore")
 
 
 PING = '只回复 JSON：{"ok": 1}。不要运行任何命令。'
