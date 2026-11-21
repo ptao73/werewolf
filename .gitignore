@@ -2,3 +2,4 @@ logs/
 __pycache__/
 access_aud.txt
 owner_email.txt
+data/

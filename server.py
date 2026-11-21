@@ -201,6 +201,104 @@ class ModelCache:
 
 
 MODELS = ModelCache()
+
+
+class Access_List:
+    """谁能玩：房主（你）永远可以；朋友第一次来输入邀请码，之后记住他的登录邮箱。
+    数据存在 data/ 目录（不进 git），重启也不会丢。"""
+    DAILY_LIMIT = 30          # 朋友当房主开的局，每天合计上限（你自己开的局不算）
+    MAX_TRIES = 5             # 每小时最多输错几次邀请码
+
+    def __init__(self):
+        # 测试时可以用 --data 指定别的目录，不碰正式名单
+        self.dir = Path(sys.argv[sys.argv.index("--data") + 1]) if "--data" in sys.argv else HERE / "data"
+        self.dir.mkdir(exist_ok=True)
+        self.file = self.dir / "access.json"
+        self.lock = threading.Lock()
+        self.tries = {}       # uid → [输错的时间]
+        self.data = json.loads(self.file.read_text()) if self.file.exists() else {}
+        self.data.setdefault("allowed", {})
+        self.data.setdefault("usage", {})
+        if not self.data.get("code"):
+            self.data["code"] = self.new_code_value()
+        self.save()
+
+    @staticmethod
+    def new_code_value():
+        import secrets
+        return "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))  # 去掉易混的 0/O/1/I
+
+    def save(self):
+        tmp = self.file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1))
+        tmp.replace(self.file)
+
+    def is_owner(self, uid):
+        import stats
+        return uid == "local:me" or (stats.owner_email() and uid == stats.owner_email())
+
+    def allowed(self, uid):
+        if self.is_owner(uid) or uid.startswith("local:"):   # local: = 本机测试
+            return True
+        with self.lock:
+            return uid in self.data["allowed"]
+
+    def redeem(self, uid, code):
+        with self.lock:
+            now = time.time()
+            t = [x for x in self.tries.get(uid, []) if now - x < 3600]
+            if len(t) >= self.MAX_TRIES:
+                return "输错次数太多，请一小时后再试"
+            if str(code or "").strip().upper() != self.data["code"]:
+                self.tries[uid] = t + [now]
+                return f"邀请码不对（还能试 {self.MAX_TRIES - len(t) - 1} 次）"
+            self.data["allowed"][uid] = {"since": time.strftime("%Y-%m-%d %H:%M"), "nick": ""}
+            self.save()
+            return None
+
+    def note_nick(self, uid, nick):
+        with self.lock:
+            if uid in self.data["allowed"] and self.data["allowed"][uid].get("nick") != nick:
+                self.data["allowed"][uid]["nick"] = nick
+                self.save()
+
+    def today(self):
+        return time.strftime("%Y-%m-%d")
+
+    def count_game(self, host):
+        """朋友当房主开局前调用：没超上限就计一局并返回 None，超了返回错误"""
+        if self.is_owner(host):
+            return None
+        with self.lock:
+            used = self.data["usage"].get(self.today(), 0)
+            if used >= self.DAILY_LIMIT:
+                return f"今天朋友们开的局已达上限（{self.DAILY_LIMIT} 局），明天再来，或请房主（网站主人）开局"
+            self.data["usage"] = {self.today(): used + 1}      # 只留今天的计数
+            self.save()
+            return None
+
+    # ----- 只有你能用的管理功能 -----
+    def admin_view(self):
+        with self.lock:
+            return {"code": self.data["code"], "limit": self.DAILY_LIMIT,
+                    "used_today": self.data["usage"].get(self.today(), 0),
+                    "allowed": [{"email": e, **v} for e, v in self.data["allowed"].items()]}
+
+    def change_code(self):
+        with self.lock:
+            self.data["code"] = self.new_code_value()
+            self.save()
+
+    def remove(self, email):
+        with self.lock:
+            if email not in self.data["allowed"]:
+                return "名单里没有这个人"
+            del self.data["allowed"][email]
+            self.save()
+            return None
+
+
+ACL = Access_List()
 GAME_IDS = iter(range(1, 10 ** 9))   # 全局唯一的局号（换房间时网页靠它清空旧消息）
 GAME_IDS_LOCK = threading.Lock()
 
@@ -278,7 +376,8 @@ class Room:
             if uid not in self.members and len(self.members) >= self.size:
                 return "房间已满"
             self.members[uid] = nick
-            return None
+        ACL.note_nick(uid, nick)
+        return None
 
     def leave(self, uid):
         """返回 (错误, 房间是否解散, 被一起移出的其他人)"""
@@ -306,6 +405,9 @@ class Room:
         with self.cond:
             if uid != self.host or self.state != "lobby":
                 return "只有房主可以开始游戏"
+            err = ACL.count_game(uid)
+            if err:
+                return err
             humans = [{"name": n, "kind": "human", "uid": u} for u, n in self.members.items()]
             with GAME_IDS_LOCK:
                 self.game_no = next(GAME_IDS)
@@ -425,6 +527,7 @@ class Room:
             return {
                 "discuss": discuss,
                 "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game,
+                       "owner": bool(ACL.is_owner(uid)),
                        "seat": mine["seat"] if mine else None, "role": mine["role"] if mine else None},
                 "room": {"id": self.id, "state": self.state, "size": self.size, "sizes": SIZES,
                          "host": self.members.get(self.host), "members": list(self.members.values()),
@@ -461,6 +564,7 @@ class Hub:
             rid, self.next_rid = self.next_rid, self.next_rid + 1
             self.rooms[rid] = Room(rid, uid, nick, size)
             self.where[uid] = rid
+        ACL.note_nick(uid, nick)
         MODELS.prewarm()                       # 大家进房间的这段时间里，后台先把 AI 检查好
         return None
 
@@ -507,7 +611,8 @@ class Hub:
             v = room.view(uid, since)
         else:      # 不在任何房间：看房间列表
             v = {"discuss": {"available": False, "busy": False, "seats": []},
-                 "me": {"nick": None, "member": False, "host": False, "in_game": False, "seat": None, "role": None},
+                 "me": {"nick": None, "member": False, "host": False, "in_game": False, "seat": None, "role": None,
+                        "owner": bool(ACL.is_owner(uid))},
                  "room": {"id": None, "state": "idle", "size": 6, "sizes": SIZES, "host": None, "members": [],
                           "ai": 0, "ai_ready": MODELS.ready()},
                  "v": VERSION, "game": 0, "pending": None, "events": [], "total": 0}
@@ -529,7 +634,8 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         if host in ("127.0.0.1", "localhost") and self.client_address[0] == "127.0.0.1" \
                 and not self.headers.get("Cf-Connecting-Ip"):
-            return "local:" + (self.headers.get("X-Test-User") or "me")   # 本机测试用
+            t = (self.headers.get("X-Test-User") or "me").lower()       # 本机测试用
+            return t if "@" in t else "local:" + t       # 带 @ 的测试身份按"真实朋友"处理（要邀请码）
         if host != PUBLIC_HOST:
             self.reply(403, {"error": "forbidden"})
             return None
@@ -565,6 +671,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, body=(HERE / "web" / "index.html").read_bytes(), ctype="text/html; charset=utf-8")
         if u.path == "/app.js":
             return self.reply(200, body=(HERE / "web" / "app.js").read_bytes(), ctype="text/javascript; charset=utf-8")
+        if not ACL.allowed(uid):      # 还没输入邀请码：其他接口一律不给
+            return self.reply(403, {"error": "需要邀请码", "need_invite": True, "v": VERSION})
+        if u.path == "/api/admin":
+            if not ACL.is_owner(uid):
+                return self.reply(403, {"error": "只有网站主人可以看"})
+            return self.reply(200, ACL.admin_view())
         if u.path == "/api/leaderboard":       # 积分榜（真人只显示昵称，不显示邮箱）
             import stats
             b = stats.leaderboard()
@@ -599,6 +711,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except Exception:
             return self.reply(400, {"error": "bad json"})
+        path = urlsplit(self.path).path
+        if path == "/api/invite":                       # 输入邀请码
+            err = ACL.redeem(uid, data.get("code"))
+            return self.reply(400 if err else 200, {"error": err} if err else {"ok": True})
+        if not ACL.allowed(uid):                        # 没放行的人不能做别的
+            return self.reply(403, {"error": "需要邀请码", "need_invite": True})
+        if path in ("/api/admin/code", "/api/admin/remove"):   # 只有你能用的管理操作
+            if not ACL.is_owner(uid):
+                return self.reply(403, {"error": "只有网站主人可以操作"})
+            err = ACL.change_code() if path == "/api/admin/code" else ACL.remove(str(data.get("email", "")))
+            return self.reply(400 if err else 200, {"error": err} if err else {"ok": True})
         size = data.get("size")
         actions = {
             "/api/room/create": lambda: HUB.create(uid, data.get("nick"), size),

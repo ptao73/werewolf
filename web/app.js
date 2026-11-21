@@ -230,6 +230,10 @@ async function tickOnce() {
   let s;
   try {
     const r = await fetch("/api/state?since=" + (game === -1 ? 0 : shown), { headers: { "X-Werewolf": "1" } });
+    if (r.status === 403) {                // 还没输入邀请码
+      const j = await r.json().catch(() => ({}));
+      if (j.need_invite) { renderInvite(); return; }
+    }
     if (!r.ok) { statusEl.textContent = "连接失败（" + r.status + "）"; return; }
     s = await r.json();
   } catch (e) {
@@ -255,6 +259,7 @@ async function tickOnce() {
   const st = s.room.state;
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
   updateStartBtn(s);
+  document.getElementById("adminBtn").hidden = !s.me.owner;
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
   const key = JSON.stringify([st, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
@@ -373,4 +378,50 @@ document.getElementById("rulesBtn").onclick = async () => {
   overlay.appendChild(el("h3", {}, "🏆 积分"));
   const pts = Object.entries(r.points).map(([k, v]) => `${r.labels[k]} ${v > 0 ? "+" : ""}${v}`).join("，");
   overlay.appendChild(el("div", { class: "rtext" }, "胜利 +10；" + pts + "。只统计打完的真实对局。"));
+};
+
+// ---------- 邀请码（朋友第一次来时输入一次）----------
+function renderInvite() {
+  statusEl.textContent = "需要邀请码";
+  startBtn.disabled = true;
+  if (panelKey === "invite") return;
+  panelKey = "invite";
+  panel.textContent = "";
+  log.textContent = "";
+  log.appendChild(el("div", { class: "ev info" }, "👋 欢迎！第一次来请输入邀请码（向网站主人要），以后就不用再输了。"));
+  const code = el("input", { type: "text", maxlength: "12", placeholder: "邀请码", autocapitalize: "characters" });
+  const err = errLine();
+  const btn = action(el("button", { class: "primary" }, "进入"), err, async () => {
+    await post("/api/invite", { code: code.value });
+    panelKey = "";
+  });
+  panel.append(row(code, btn), err);
+}
+
+// ---------- 网站主人的管理页：邀请码、已加入的人、今天朋友开了几局 ----------
+document.getElementById("adminBtn").onclick = async () => {
+  overlay.textContent = "";
+  overlay.hidden = false;
+  overlay.appendChild(row(el("button", { class: "primary", onclick: () => (overlay.hidden = true) }, "← 回到游戏")));
+  let a;
+  try { a = await (await fetch("/api/admin")).json(); }
+  catch (e) { overlay.appendChild(el("div", { class: "err" }, "读取失败：" + e.message)); return; }
+  overlay.appendChild(el("h2", {}, "⚙ 管理"));
+  overlay.appendChild(el("div", { class: "rtext" }, `邀请码：${a.code}\n把它发给朋友。换新邀请码后，旧的就不能用了（已经进来的人不受影响）。`));
+  const err = errLine();
+  overlay.append(row(action(el("button", {}, "换新邀请码"), err, async () => {
+    if (!confirm("确定换新邀请码？旧的会失效。")) throw new Error("已取消");
+    await post("/api/admin/code"); document.getElementById("adminBtn").click();
+  })), err);
+  overlay.appendChild(el("h3", {}, `今天朋友开局：${a.used_today} / ${a.limit}（你自己开的不算）`));
+  overlay.appendChild(el("h3", {}, `已加入的朋友（${a.allowed.length}）`));
+  for (const p of a.allowed) {
+    const line = el("div", { class: "line" });
+    line.appendChild(el("span", { class: "grow" }, `${p.nick || "（还没起昵称）"} · ${p.email} · ${p.since}`));
+    line.appendChild(action(el("button", { class: "danger" }, "移除"), err, async () => {
+      if (!confirm(`移除 ${p.email}？他需要重新输入邀请码才能再进来。`)) throw new Error("已取消");
+      await post("/api/admin/remove", { email: p.email }); document.getElementById("adminBtn").click();
+    }));
+    overlay.appendChild(line);
+  }
 };
