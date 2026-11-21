@@ -44,6 +44,10 @@ class Quit(Exception):
     """玩家选择退出游戏"""
 
 
+class NotEnoughModels(Exception):
+    """可用模型不够开一局"""
+
+
 class Game:
     def __init__(self, entries, spare, fake=False, auto=False):
         self.fake, self.auto = fake, auto
@@ -58,6 +62,8 @@ class Game:
         self.public = []               # 所有人都能看到的公开记录
         self.antidote = self.poison = True
         self.day = 0
+        self.night_now = False
+        self.deferred = []          # 夜里发生、要等天亮才公布的消息
         Path(__file__).with_name("logs").mkdir(exist_ok=True)
         self.logfile = Path(__file__).with_name("logs") / f"game-{datetime.now():%Y%m%d-%H%M%S}.log"
         self.workdir = tempfile.mkdtemp(prefix="werewolf-")  # AI 在空目录里运行，碰不到你的文件
@@ -79,9 +85,13 @@ class Game:
         with open(self.logfile, "a", errors="replace") as f:   # 万一有怪字符也不崩溃
             f.write(text + "\n")
 
+    def emit(self, text, kind="info"):
+        """所有给你看的文字都从这里出去。kind: public 公开 / private 私密 / info 提示 / thinking 思考中"""
+        print(text, flush=True)
+
     def say(self, text):
         """公开信息：打印到屏幕 + 写进公开记录"""
-        print(text)
+        self.emit(text, "public")
         self.public.append(text)
         self.log(text)
 
@@ -90,7 +100,7 @@ class Game:
         p["notes"].append(text)
         self.log(f"[私密→{self.label(p)}] {text}")
         if self.is_human(p):
-            print(f"  🔒 {text}")
+            self.emit(f"  🔒 {text}", "private")
 
     # ---------- 询问玩家 ----------
     def ask(self, p, task, choices=None, allow_none=False, speech=False):
@@ -156,11 +166,11 @@ class Game:
             self.on_failure(p, out, None)   # 你选 r 会重试；选 s 后 p 已换成新模型，再循环一次
 
     def on_failure(self, p, err, retry):
-        print(f"\n⚠️  {self.label(p)} 调用失败：{err}")
+        who = "夜间某位玩家（保密）" if self.night_now else self.label(p)
+        self.emit(f"\n⚠️  {who} 调用失败：{err}", "warn")
         self.log(f"[失败 {self.label(p)}] {err}")
         while True:
-            restore_tty()
-            c = input("   r=重试  s=换一个模型接替  q=退出游戏：").strip().lower()
+            c = self.ask_failure()
             if c == "q":
                 raise Quit()
             if c == "s" and not self.substitute(p):
@@ -168,21 +178,31 @@ class Game:
             if c in ("r", "s"):
                 return retry() if retry else None
 
+    def ask_failure(self):
+        """AI 调用失败时问你怎么办，返回 r / s / q"""
+        restore_tty()
+        return input("   r=重试  s=换一个模型接替  q=退出游戏：").strip().lower()
+
     def substitute(self, p):
         """从备用模型里找一个可用的，接替 p 的座位（身份和记忆都保留）"""
         random.shuffle(self.spare)
         while self.spare:
             cand = self.spare.pop()
-            print(f"   检查 {cand['name']} 是否可用…", flush=True)
+            self.emit(f"   检查 {cand['name']} 是否可用…", "info")
             ok, err = run_cli(cand, PING, 90, self.workdir)
             if not ok:
-                print(f"   ⚠️  {cand['name']} 不可用：{err[-150:]}")
+                self.emit(f"   ⚠️  {cand['name']} 不可用：{err[-150:]}", "warn")
                 continue
             old = self.label(p)
             p.update(name=cand["name"], kind=cand["kind"], model=cand["model"])
-            self.say(f"📢 {old} 掉线，由 {self.label(p)} 接替（身份不变）")
+            msg = f"📢 {old} 掉线，由 {self.label(p)} 接替（身份不变）"
+            if self.night_now:
+                self.deferred.append(msg)   # 夜里换人先不公布，天亮再说，避免暴露谁在夜里行动
+                self.emit("   已换人接替，天亮后公布。", "info")
+            else:
+                self.say(msg)
             return True
-        print("   没有可用的备用模型了。")
+        self.emit("   没有可用的备用模型了。", "warn")
         return False
 
     @staticmethod
@@ -206,12 +226,15 @@ class Game:
         return None
 
     def thinking(self, p):
-        if not self.is_human(p):
-            print(f"   …{self.label(p)} 思考中", flush=True)
+        # 夜里不显示谁在思考：否则大家就知道谁是狼人/预言家/女巫了
+        if not self.is_human(p) and not self.night_now:
+            self.emit(f"   …{self.label(p)} 思考中", "thinking")
 
     def night(self):
         self.day += 1
         self.say(f"\n🌙 ===== 第 {self.day} 夜 =====  天黑请闭眼")
+        self.night_now = True
+        self.emit("   🌙 夜间行动中…（不显示是谁，以免暴露身份）", "thinking")
         alive = self.alive()
 
         # 1) 狼人：按座位依次提议，后面的狼看得到前面的提议，最后一只狼拍板（你是狼的话你最后决定）
@@ -236,9 +259,10 @@ class Game:
             if self.antidote:
                 self.tell(witch, f"第{self.day}夜：今晚被狼人杀的是 {self.label(victim)}")
                 self.thinking(witch)
-                _, s = self.ask(witch, f"你是女巫。要用解药救 {self.label(victim)} 吗？target 填 1=救，0=不救。",
-                                [{"seat": 1, "name": "救", "role": ""}], allow_none=True)
-                if s == 1:
+                # 救就填被杀者的座位号，不救填 0（以前用 1=救 容易被 AI 误解成座位号）
+                _, s = self.ask(witch, f"你是女巫。要用解药救 {self.label(victim)} 吗？救就填 {victim['seat']}，不救填 0。",
+                                [victim], allow_none=True)
+                if s == victim["seat"]:
                     self.antidote, saved = False, True
                     dead = []
                     self.tell(witch, f"第{self.day}夜：你用解药救了 {self.label(victim)}")
@@ -263,7 +287,11 @@ class Game:
         dead = list({p["seat"]: p for p in dead}.values())
         for p in dead:
             p["alive"] = False
+        self.night_now = False
         self.say(f"\n☀️  ===== 第 {self.day} 天 =====  天亮了")
+        for msg in self.deferred:
+            self.say(msg)
+        self.deferred = []
         self.say("昨晚死亡：" + ("、".join(self.label(p) for p in dead) if dead else "平安夜，没有人死亡"))
         return dead
 
@@ -312,9 +340,7 @@ class Game:
         self.last_words(out)
 
     def run(self):
-        print("🐺 狼人杀开始！座位：")
-        for p in self.players:
-            print(f"   {self.label(p)}")
+        self.emit("🐺 狼人杀开始！座位：\n" + "\n".join(f"   {self.label(p)}" for p in self.players), "public")
         self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
         self.log("身份（秘密）：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players))
         me = self.human()
@@ -336,8 +362,8 @@ class Game:
             self.say("\n游戏已退出。")
         except (KeyboardInterrupt, EOFError):
             self.say("\n游戏被中断。")
-        print("身份揭晓：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players))
-        print(f"完整记录（含所有私密信息）：{self.logfile}")
+        self.emit("身份揭晓：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players), "reveal")
+        self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "info")
 
 
 # 开局时的终端设置（防止 AI 工具把终端改成"按回车没反应"的状态）
@@ -403,7 +429,7 @@ def find_models(names):
     return chosen
 
 
-def pick_players(wanted, need, fake):
+def pick_players(wanted, need, fake, out=print):
     """先用你指定的，再随机补齐；每个都先测一下能不能用，不能用的提示并跳过"""
     workdir = tempfile.mkdtemp(prefix="werewolf-check-")
     queue = wanted[:]                                   # 指定的排在前面
@@ -416,7 +442,7 @@ def pick_players(wanted, need, fake):
         if fake:                                        # 测试模式不真的调用
             ok_list += batch
             continue
-        print("检查模型是否可用：" + "、".join(m["name"] for m in batch), flush=True)
+        out("检查模型是否可用：" + "、".join(m["name"] for m in batch))
         with ThreadPoolExecutor(len(batch)) as ex:      # 同时检查，节省时间
             results = list(ex.map(lambda m: run_cli(m, PING, 90, workdir), batch))
         for m, (ok, err) in zip(batch, results):
@@ -424,9 +450,9 @@ def pick_players(wanted, need, fake):
                 ok_list.append(m)
             else:
                 first = next((l for l in err.splitlines() if "ERROR" in l or "error" in l), err)
-                print(f"⚠️  {m['name']} 不可用，本局不参加：{first[-200:]}")
+                out(f"⚠️  {m['name']} 不可用，本局不参加：{first[-200:]}")
     if len(ok_list) < need:
-        sys.exit(f"可用模型只有 {len(ok_list)} 个，不够 {need} 个，游戏无法开始。")
+        raise NotEnoughModels(f"可用模型只有 {len(ok_list)} 个，不够 {need} 个，游戏无法开始。")
     return ok_list, queue                               # queue 里剩下的是没测过的备用模型
 
 
@@ -447,7 +473,10 @@ if __name__ == "__main__":
         sys.exit(f"最多指定 {need} 个模型。")
     while True:
         # 每局都重新抽取、重新检查模型（额度可能刚恢复或刚用完）
-        chosen, spare = pick_players(wanted, need, a.fake)
+        try:
+            chosen, spare = pick_players(wanted, need, a.fake)
+        except NotEnoughModels as e:
+            sys.exit(str(e))
         entries = chosen if a.auto else chosen + [HUMAN]
         Game(entries, spare, fake=a.fake, auto=a.auto).run()
         if a.auto:          # 全自动测试模式：只玩一局
