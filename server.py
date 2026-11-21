@@ -147,6 +147,8 @@ class Controller:
         self.next_id = 0
         self.stop_flag = False
         self.last_game = None          # 刚结束的那一局（赛后讨论用）
+        self.model_ok, self.model_time = [], 0   # 后台检查过的可用模型、检查时间
+        self.checking = False
         self.asking = False            # 赛后讨论：同一时间只问一个问题
 
     # ----- 游戏线程用 -----
@@ -173,6 +175,56 @@ class Controller:
                 return self.answers.pop(uid)
             finally:
                 self.pending.pop(uid, None)
+
+    # ----- 后台检查 AI 模型（开房间时就开始，开局时直接用结果，不用再等）-----
+    CACHE_SECONDS = 15 * 60
+
+    def prewarm(self):
+        """如果结果已过期且没在检查，就在后台检查一遍全部模型"""
+        with self.cond:
+            if self.checking or (time.time() - self.model_time < self.CACHE_SECONDS and self.model_ok):
+                return
+            self.checking = True
+        threading.Thread(target=self.check_models, daemon=True).start()
+
+    def check_models(self):
+        try:
+            if FAKE:
+                ok = list(w.MODEL_POOL)
+            else:
+                import tempfile
+                from concurrent.futures import ThreadPoolExecutor
+                d = tempfile.mkdtemp(prefix="werewolf-check-")
+                with ThreadPoolExecutor(len(w.MODEL_POOL)) as ex:
+                    res = list(ex.map(lambda m: w.run_cli(m, w.PING, w.PING_TIMEOUT, d), w.MODEL_POOL))
+                ok = [m for m, (good, _) in zip(w.MODEL_POOL, res) if good]
+                bad = [f"{m['name']}: {err.splitlines()[-1][-120:] if err else '?'}"
+                       for m, (good, err) in zip(w.MODEL_POOL, res) if not good]
+                print(f"[模型检查] 可用 {len(ok)}/{len(w.MODEL_POOL)}" + (f"；不可用：{bad}" if bad else ""),
+                      file=sys.stderr, flush=True)
+            with self.cond:
+                self.model_ok, self.model_time = ok, time.time()
+        finally:
+            with self.cond:
+                self.checking = False
+                self.cond.notify_all()
+
+    def ready_models(self, need):
+        """开局时取 AI：优先用后台检查的结果；正在检查就等它；都没有才现场检查"""
+        with self.cond:
+            end = time.time() + 60
+            while self.checking and time.time() < end:
+                self.cond.wait(1)
+            fresh = time.time() - self.model_time < self.CACHE_SECONDS and self.model_ok
+            ok = list(self.model_ok) if fresh else None
+        if not ok:
+            return None
+        random.shuffle(ok)
+        chosen = ok[:need]
+        while len(chosen) < need:              # 可用模型不够坐满：同一模型坐多个座位
+            chosen.append(dict(random.choice(ok)))
+        spare = [dict(m) for m in ok]          # 中途有 AI 出错时的替补
+        return [dict(m) for m in chosen], spare
 
     # ----- 网页请求用（都要先拿到锁）-----
     def give_answer(self, uid, data):
@@ -205,7 +257,8 @@ class Controller:
             self.state, self.host, self.size = "lobby", uid, size
             self.members = {uid: nick}
             self.events, self.players = [], set()
-            return None
+        self.prewarm()                         # 大家进房间的这段时间里，后台先把 AI 检查好
+        return None
 
     def join(self, uid, nick):
         nick = self.clean_nick(nick)
@@ -258,12 +311,14 @@ class Controller:
         need = size - len(humans)
         try:
             game_log = []
-            if need:
-                self.add(f"🤖 正在准备 {need} 个 AI 玩家…（约 10 秒）", "info")
+            ready = self.ready_models(need) if need else ([], [])
+            if ready:
+                chosen, spare = ready
+                game_log.append("用后台检查结果：" + "、".join(m["name"] for m in chosen))
+            else:
+                self.add(f"🤖 正在准备 {need} 个 AI 玩家…（约 15 秒）", "info")
                 # 检查过程只写日志：不让大家知道有哪些模型
                 chosen, spare = w.pick_players([], need, FAKE, out=game_log.append, allow_repeat=True)
-            else:
-                chosen, spare = [], []
             g = WebGame(self, chosen + humans, spare, fake=FAKE)
             for line in game_log:
                 g.log("[模型检查] " + line)
@@ -280,6 +335,7 @@ class Controller:
                 self.state = "lobby" if self.host in self.members else "idle"
                 self.pending, self.stop_flag = {}, False
                 self.cond.notify_all()
+            self.prewarm()                     # 为下一局提前检查
 
     def discuss(self, uid, seat, question):
         """赛后讨论：房间里的人问某位 AI（seat=0 表示问所有 AI）"""
@@ -349,7 +405,9 @@ class Controller:
                 "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game},
                 "room": {"state": self.state, "size": self.size, "sizes": SIZES,
                          "host": self.members.get(self.host), "members": list(self.members.values()),
-                         "ai": max(0, self.size - len(self.members))},
+                         "ai": max(0, self.size - len(self.members)),
+                         "ai_ready": (not self.checking) and bool(self.model_ok)
+                                     and time.time() - self.model_time < self.CACHE_SECONDS},
                 "game": self.game_no, "pending": p, "events": evs, "total": len(self.events),
             }
 

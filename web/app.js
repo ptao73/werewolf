@@ -131,6 +131,7 @@ function renderLobby(s) {
   panel.appendChild(el("div", { class: "task" },
     `房间：${r.size} 人局 · 房主 ${r.host} · 已加入 ${r.members.length} 人，开始后由 ${r.ai} 个 AI 补位`));
   panel.appendChild(el("div", { class: "members" }, "👥 " + r.members.join("、")));
+  if (r.ai > 0) panel.appendChild(el("div", { class: "info" }, r.ai_ready ? "🤖 AI 玩家已就绪，开局无需等待" : "🤖 正在后台准备 AI 玩家…"));
   if (!me.member) {
     const nick = nickInput();
     panel.append(row(nick, action(el("button", { class: "primary" }, "加入"), err,
@@ -206,7 +207,7 @@ async function tickOnce() {
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
-  const key = JSON.stringify([st, s.room.members, s.room.size, s.me, s.pending && s.pending.id, game,
+  const key = JSON.stringify([st, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
                              s.discuss.available, s.discuss.busy]);
   if (key !== panelKey) {
     panelKey = key;

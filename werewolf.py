@@ -56,7 +56,8 @@ def rules_text(n):
     return "\n".join(lines)
 
 
-AI_TIMEOUT = 240  # 每次调用 AI 的最长等待秒数
+AI_TIMEOUT = 120  # 每次调用 AI 的最长等待秒数（正常 7-15 秒；超时就按失败处理：重试/换模型）
+PING_TIMEOUT = 45 # 开局前检查模型是否可用的最长等待秒数
 
 
 class Quit(Exception):
@@ -255,7 +256,7 @@ class Game:
                 cand = self.spare.pop()
             if not self.anonymous:
                 self.emit(f"   检查 {cand['name']} 是否可用…", "info")
-            ok, err = run_cli(cand, PING, 90, self.workdir)
+            ok, err = run_cli(cand, PING, PING_TIMEOUT, self.workdir)
             if not ok:
                 self.log(f"[替补不可用 {cand['name']}] {err[-150:]}")
                 if not self.anonymous:
@@ -391,28 +392,19 @@ class Game:
         self.emit("   🌙 夜间行动中…（不显示是谁，以免暴露身份）", "thinking")
         alive = self.alive()
 
-        # 0) 守卫：守护一人，不能连续两晚守同一人
-        guarded = 0
-        guard = self.role_of("守卫")
-        if guard:
-            opts = [p for p in alive if p["seat"] != self.last_guard]
-            _, guarded = self.ask(guard, "你是守卫。选择今晚要守护的人（可以守自己；不能和上一晚相同；0=不守）。",
-                                  opts, allow_none=True)
-            self.last_guard = guarded
-            self.tell(guard, f"第{self.day}夜：你守护了 {guarded}号" if guarded else f"第{self.day}夜：你没有守护任何人")
-
-        # 1) 狼人：按座位依次提议，后面的狼看得到前面的提议，最后一只狼拍板（真人狼排在最后）
-        wolves = [p for p in alive if p["role"] == "狼人"]
-        wolves.sort(key=lambda p: self.is_human(p))
-        kill = 0
-        for w in wolves:
-            _, kill = self.ask(w, "你是狼人。选择今晚要杀的人（可以和队友商量的结果一致）。", alive)
-            for mate in wolves:
-                if mate is not w:
-                    self.tell(mate, f"第{self.day}夜：狼队友 {self.label(w)} 提议杀 {kill}号")
-        victim = self.by_seat(kill)
-        for w in wolves:
-            self.tell(w, f"第{self.day}夜：狼队最终决定杀 {self.label(victim)}")
+        # 守卫、狼人、预言家互不依赖 → 同时行动（省时间）；女巫要知道刀口，所以最后单独行动
+        # 终端版里如果你自己有夜间行动，就按顺序来（在后台线程里等你输入时按 Ctrl+C 会卡住）
+        human_acts = any(self.is_human(p) and p["role"] in ("守卫", "狼人", "预言家") for p in alive)
+        if self.parallel_votes or not human_acts:
+            with ThreadPoolExecutor(3) as ex:
+                f_guard = ex.submit(self.night_guard, alive)
+                f_wolves = ex.submit(self.night_wolves, alive)
+                f_seer = ex.submit(self.night_seer, alive)
+                guarded, victim = f_guard.result(), f_wolves.result()
+                f_seer.result()
+        else:
+            guarded, victim = self.night_guard(alive), self.night_wolves(alive)
+            self.night_seer(alive)
 
         # 2) 女巫
         saved, poisoned = False, None
@@ -434,13 +426,6 @@ class Game:
                     poisoned = self.by_seat(t)
                     self.tell(witch, f"第{self.day}夜：你毒了 {t}号")
 
-        # 3) 预言家
-        seer = self.role_of("预言家")
-        if seer:
-            _, t = self.ask(seer, "你是预言家。选择今晚要查验的人。", [p for p in alive if p is not seer])
-            q = self.by_seat(t)
-            self.tell(seer, f"第{self.day}夜查验：{self.label(q)} 是{'狼人' if q['role'] == '狼人' else '好人'}")
-
         # 结算：被守护或被救（只有其一）就活下来；同守同救仍然死亡；毒药挡不住
         dead = {}   # 座位号 → (玩家, 死因)
         if saved == (guarded == victim["seat"]):      # 既没守也没救，或者同守同救 → 死
@@ -458,6 +443,57 @@ class Game:
         self.deferred = []
         self.say("昨晚死亡：" + ("、".join(self.label(p) for p, _ in dead) if dead else "平安夜，没有人死亡"))
         return dead
+
+    def night_guard(self, alive):
+        """守卫：守护一人，不能连续两晚守同一人。返回守护的座位号（0=不守）"""
+        guard = self.role_of("守卫")
+        if not guard:
+            return 0
+        opts = [p for p in alive if p["seat"] != self.last_guard]
+        _, guarded = self.ask(guard, "你是守卫。选择今晚要守护的人（可以守自己；不能和上一晚相同；0=不守）。",
+                              opts, allow_none=True)
+        self.last_guard = guarded
+        self.tell(guard, f"第{self.day}夜：你守护了 {guarded}号" if guarded else f"第{self.day}夜：你没有守护任何人")
+        return guarded
+
+    def night_wolves(self, alive):
+        """狼人：AI 狼同时提议；有真人狼的话，真人看到 AI 队友的提议后拍板；否则按多数（平票随机）。返回被杀的玩家"""
+        wolves = [p for p in alive if p["role"] == "狼人"]
+        ai = [p for p in wolves if not self.is_human(p)]
+        humans = [p for p in wolves if self.is_human(p)]
+        task = "你是狼人。选择今晚要杀的人（队友也在同时选，最后按多数决定）。"
+        proposals = {}
+        if ai:
+            with ThreadPoolExecutor(len(ai)) as ex:
+                for p, (_, k) in zip(ai, ex.map(lambda p: self.ask(p, task, alive), ai)):
+                    proposals[p["seat"]] = k
+        for p in wolves:
+            for s_, k in proposals.items():
+                if s_ != p["seat"]:
+                    self.tell(p, f"第{self.day}夜：狼队友 {s_}号 提议杀 {k}号")
+        kill = 0
+        for h in humans:   # 真人狼看到 AI 队友的提议后决定（多个真人狼时，最后一个说了算）
+            _, kill = self.ask(h, "你是狼人。参考队友的提议，决定今晚要杀的人（你说了算）。", alive)
+            proposals[h["seat"]] = kill
+            for p in wolves:
+                if p is not h:
+                    self.tell(p, f"第{self.day}夜：狼队友 {self.label(h)} 提议杀 {kill}号")
+        if not humans:
+            votes = list(proposals.values())
+            top = max(votes.count(v) for v in votes)
+            kill = random.choice(sorted({v for v in votes if votes.count(v) == top}))
+        victim = self.by_seat(kill)
+        for p in wolves:
+            self.tell(p, f"第{self.day}夜：狼队最终决定杀 {self.label(victim)}")
+        return victim
+
+    def night_seer(self, alive):
+        seer = self.role_of("预言家")
+        if not seer:
+            return
+        _, t = self.ask(seer, "你是预言家。选择今晚要查验的人。", [p for p in alive if p is not seer])
+        q = self.by_seat(t)
+        self.tell(seer, f"第{self.day}夜查验：{self.label(q)} 是{'狼人' if q['role'] == '狼人' else '好人'}")
 
     def last_words(self, p):
         self.thinking(p)
@@ -640,7 +676,7 @@ def pick_players(wanted, need, fake, out=print, allow_repeat=False):
             continue
         out("检查模型是否可用：" + "、".join(m["name"] for m in batch))
         with ThreadPoolExecutor(len(batch)) as ex:      # 同时检查，节省时间
-            results = list(ex.map(lambda m: run_cli(m, PING, 90, workdir), batch))
+            results = list(ex.map(lambda m: run_cli(m, PING, PING_TIMEOUT, workdir), batch))
         for m, (ok, err) in zip(batch, results):
             if ok:
                 ok_list.append(m)
