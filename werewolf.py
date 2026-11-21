@@ -6,7 +6,7 @@
 看模型池：  python3 werewolf.py --list
 测试：      python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，不花额度）
 """
-import json, random, re, subprocess, sys, tempfile, time, argparse
+import json, random, re, subprocess, sys, tempfile, time, argparse, termios
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +104,7 @@ class Game:
         return self.ask_ai(p, task, valid, allow_none, speech)
 
     def ask_human(self, task, choices, allow_none, speech):
+        restore_tty()
         print(f"\n👉 {task}")
         text = ""
         if speech:
@@ -156,6 +157,7 @@ class Game:
         print(f"\n⚠️  {self.label(p)} 调用失败：{err}")
         self.log(f"[失败 {self.label(p)}] {err}")
         while True:
+            restore_tty()
             c = input("   r=重试  s=换一个模型接替  q=退出游戏：").strip().lower()
             if c == "q":
                 raise Quit()
@@ -336,6 +338,15 @@ class Game:
         print(f"完整记录（含所有私密信息）：{self.logfile}")
 
 
+# 开局时的终端设置（防止 AI 工具把终端改成"按回车没反应"的状态）
+TTY_SAVED = termios.tcgetattr(0) if sys.stdin.isatty() else None
+
+
+def restore_tty():
+    if TTY_SAVED is not None:
+        termios.tcsetattr(0, termios.TCSADRAIN, TTY_SAVED)
+
+
 PING = '只回复 JSON：{"ok": 1}。不要运行任何命令。'
 
 
@@ -344,19 +355,22 @@ def run_cli(p, prompt, timeout, workdir):
     try:
         if p["kind"] == "claude":
             cmd = ["claude", "-p", "--model", p["model"], "--tools", ""]
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout, cwd=workdir)
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout, cwd=workdir,
+                               start_new_session=True)
             out = r.stdout
         elif p["kind"] == "codex":
             # 每次用不同的输出文件，避免同时检查多个模型时互相覆盖
             outf = Path(tempfile.mkstemp(dir=workdir, suffix=".txt")[1])
             cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
                    "-m", p["model"], "-C", workdir, "-o", str(outf), "-"]
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout,
+                               start_new_session=True)
             out = outf.read_text()
             outf.unlink(missing_ok=True)
         else:  # agy
             cmd = ["agy", "-p", prompt, "--model", p["model"], "--print-timeout", "0"]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=workdir)
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                               cwd=workdir, start_new_session=True)
             out = r.stdout
         if r.returncode == 0 and out.strip():
             return True, out
