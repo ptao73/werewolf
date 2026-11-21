@@ -3,6 +3,7 @@
 const log = document.getElementById("log");
 const panel = document.getElementById("panel");
 const statusEl = document.getElementById("status");
+let meSeat = null, meRole = null;      // 我的座位和身份（用来在座位表里标蓝）
 let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0, draftQ = "", draftSeat = "0";
 
 function el(tag, attrs = {}, text) {
@@ -36,7 +37,23 @@ function action(button, errEl, fn) {
   return button;
 }
 
+function addSeats(ev) {
+  // 座位表：自己标蓝（带身份），出局的标红并划线
+  const box = el("div", { class: "ev seats-ev" });
+  box.appendChild(el("div", {}, ev.data.title));
+  const row_ = el("div", { class: "seats" });
+  for (const x of ev.data.seats) {
+    let cls = "seat", txt = x.seat + "号";
+    if (x.seat === meSeat) { cls += " me"; txt += "（你" + (meRole ? "·" + meRole : "") + "）"; }
+    if (!x.alive) { cls += " dead"; txt += " 出局"; }
+    row_.appendChild(el("span", { class: cls }, txt));
+  }
+  box.appendChild(row_);
+  log.appendChild(box);
+}
+
 function addEvent(ev) {
+  if (ev.kind === "seats" && ev.data) return addSeats(ev);
   let cls = ev.kind;
   if (ev.text.includes("===== 第") && ev.text.includes("夜")) cls += " night";
   if (ev.text.includes("===== 第") && ev.text.includes("天 =====")) cls += " day";
@@ -196,6 +213,7 @@ async function tickOnce() {
     game = s.game; log.textContent = ""; shown = 0; panelKey = ""; follow = true;
     if (!firstLoad) { tickAgain = true; return; }
   }
+  meSeat = s.me.seat; meRole = s.me.role;
   for (const ev of s.events) {
     if (ev.i < shown) continue;          // 已经显示过的消息不再重复显示
     addEvent(ev); shown = ev.i + 1;

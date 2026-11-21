@@ -101,11 +101,16 @@ class WebGame(w.Game):
                 self.quit_raised = True
                 raise w.Quit()
 
-    def emit(self, text, kind="info", to=None):
+    def emit(self, text, kind="info", to=None, data=None):
         if kind == "logpath":          # 日志路径只给管理员看，不发到网页
             return
-        self.ctl.add(text, kind, to["uid"] if to else None)
+        self.ctl.add(text, kind, to["uid"] if to else None, data)
         self.check_stop()
+
+    def intro(self, h):
+        # 网页版：座位和身份直接显示在座位表里（自己标蓝），不再单独发一行
+        h["notes"].append(f"你是 {h['seat']}号，身份：{h['role']}")
+        self.log(f"[私密→{self.real_label(h)}] 你是 {h['seat']}号，身份：{h['role']}")
 
     def call_ai(self, p, prompt):
         self.check_stop()              # 夜里没有输出时也能尽快停下
@@ -147,14 +152,15 @@ class Controller:
         self.next_id = 0
         self.stop_flag = False
         self.last_game = None          # 刚结束的那一局（赛后讨论用）
+        self.current_game = None       # 正在进行（或刚结束）的一局
         self.model_ok, self.model_time = [], 0   # 后台检查过的可用模型、检查时间
         self.checking = False
         self.asking = False            # 赛后讨论：同一时间只问一个问题
 
     # ----- 游戏线程用 -----
-    def add(self, text, kind, to=None):
+    def add(self, text, kind, to=None, data=None):
         with self.cond:
-            self.events.append({"i": len(self.events), "kind": kind, "text": text, "to": to})
+            self.events.append({"i": len(self.events), "kind": kind, "text": text, "to": to, "data": data})
             self.cond.notify_all()
 
     def wait_answer(self, uid, spec, timeout):
@@ -302,7 +308,7 @@ class Controller:
             self.state, self.players = "running", set(self.members)
             self.events, self.game_no = [], self.game_no + 1
             self.pending, self.answers, self.stop_flag = {}, {}, False
-            self.last_game, self.asking = None, False
+            self.last_game, self.asking, self.current_game = None, False, None
             size = self.size
         threading.Thread(target=self.run_game, args=(humans, size), daemon=True).start()
         return None
@@ -320,6 +326,8 @@ class Controller:
                 # 检查过程只写日志：不让大家知道有哪些模型
                 chosen, spare = w.pick_players([], need, FAKE, out=game_log.append, allow_repeat=True)
             g = WebGame(self, chosen + humans, spare, fake=FAKE)
+            with self.cond:
+                self.current_game = g
             for line in game_log:
                 g.log("[模型检查] " + line)
             g.run()
@@ -391,18 +399,20 @@ class Controller:
             member = uid in self.members
             in_game = uid in self.players
             show = in_game or (self.state != "running" and member)
-            evs = [{"i": e["i"], "kind": e["kind"], "text": e["text"]}
+            evs = [{"i": e["i"], "kind": e["kind"], "text": e["text"], "data": e.get("data")}
                    for e in self.events[since:] if show and (e["to"] is None or e["to"] == uid)]
             p = self.pending.get(uid)
             if p:
                 p = dict(p, seconds_left=max(0, int(p["deadline"] - time.time())))
                 p.pop("deadline", None)
+            mine = next((p for p in self.current_game.players if p.get("uid") == uid), None) if self.current_game else None
             g = self.last_game
             discuss = {"available": bool(g and self.state == "lobby" and member), "busy": self.asking,
                        "seats": [{"seat": p["seat"], "label": g.real_label(p)} for p in g.ai_seats()] if g else []}
             return {
                 "discuss": discuss,
-                "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game},
+                "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game,
+                       "seat": mine["seat"] if mine else None, "role": mine["role"] if mine else None},
                 "room": {"state": self.state, "size": self.size, "sizes": SIZES,
                          "host": self.members.get(self.host), "members": list(self.members.values()),
                          "ai": max(0, self.size - len(self.members)),

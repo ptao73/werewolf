@@ -128,10 +128,21 @@ class Game:
         with self.lock, open(self.logfile, "a", errors="replace") as f:   # 万一有怪字符也不崩溃
             f.write(text + "\n")
 
-    def emit(self, text, kind="info", to=None):
+    def emit(self, text, kind="info", to=None, data=None):
         """所有给玩家看的文字都从这里出去。kind: public / private / info / thinking / warn / reveal
         to=某个玩家 表示只给这个人看（终端版只有你一个人，所以直接打印）"""
         print(text, flush=True)
+
+    def show_seats(self, title):
+        """显示座位表：出局的标 ❌（网页版会把你自己标蓝、出局的标红）"""
+        mark = lambda p: ("❌" if not p["alive"] else "") + self.label(p) + \
+            ("（你）" if self.is_human(p) and not self.anonymous else "")
+        self.emit(title + "\n   " + "  ".join(mark(p) for p in self.players), "seats",
+                  data={"title": title, "seats": [{"seat": p["seat"], "alive": p["alive"]} for p in self.players]})
+
+    def intro(self, h):
+        """告诉真人玩家自己的座位和身份"""
+        self.tell(h, f"你是 {h['seat']}号，身份：{h['role']}")
 
     def say(self, text):
         """公开信息：所有人可见 + 写进公开记录"""
@@ -537,6 +548,7 @@ class Game:
         if self.winner():
             return
         # 发言：从随机的存活玩家开始，按座位顺序
+        self.show_seats("📋 发言前座位：")
         alive = self.alive()
         k = random.randrange(len(alive))
         for p in alive[k:] + alive[:k]:
@@ -564,7 +576,7 @@ class Game:
         self.hunter_shot(out, "vote")
 
     def run(self):
-        self.emit(f"🐺 {self.n} 人狼人杀开始！座位：\n" + "\n".join(f"   {self.label(p)}" for p in self.players), "public")
+        self.show_seats(f"🐺 {self.n} 人狼人杀开始！座位：")
         with self.lock:
             self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
         self.log("身份（秘密）：" + "、".join(f"{self.real_label(p)}={p['role']}" for p in self.players))
@@ -574,7 +586,7 @@ class Game:
         if self.fake:
             self.log("[模式] fake")
         for h in self.humans():
-            self.tell(h, f"你是 {h['seat']}号，身份：{h['role']}")
+            self.intro(h)
         for w in (p for p in self.players if p["role"] == "狼人"):
             mates = [self.label(m) for m in self.players if m["role"] == "狼人" and m is not w]
             self.tell(w, f"你的狼队友是：{'、'.join(mates)}")

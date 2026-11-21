@@ -45,6 +45,10 @@
   #board th:nth-child(2), #board td:nth-child(2) { text-align:left; }
   #board .detail { color:var(--dim); font-size:12px; white-space:normal; text-align:left; }
   #board .rules { color:var(--dim); font-size:13px; margin-top:10px; }
+  .seats { display:flex; flex-wrap:wrap; gap:6px 8px; margin:4px 0 2px 2px; }
+  .seat { padding:2px 8px; border:1px solid #333845; border-radius:6px; }
+  .seat.me { color:var(--priv); border-color:var(--priv); font-weight:600; }
+  .seat.dead { color:var(--warn); border-color:#5a2f2b; text-decoration:line-through; }
   .err { color:var(--warn); margin-top:6px; min-height:1em; font-size:14px; }
 </style>
 </head>
