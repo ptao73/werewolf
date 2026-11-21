@@ -129,9 +129,24 @@ function renderTurn(p) {
 
 // ---------- 大厅 ----------
 function renderIdle(s) {
-  const nick = nickInput(), size = sizeSelect(s.room.sizes, 6), err = errLine();
-  const btn = action(el("button", { class: "primary" }, "创建房间"), err,
-    () => post("/api/room/create", { nick: nick.value, size: Number(size.value) }));
+  // 不在任何房间：上面是现有房间（可加入），下面一行是昵称 + 开新房间
+  const nick = nickInput(), err = errLine();
+  for (const r of s.rooms) {
+    const open = r.state === "lobby" && r.members < r.size;
+    const status = r.state === "running" ? "游戏中" : open ? "等人中" : "已满";
+    const line = el("div", { class: "line" });
+    line.appendChild(el("span", { class: "grow" }, `#${r.id} · ${r.size}人局 · 房主 ${r.host} · 👥${r.members}/${r.size} · ${status}`));
+    const b = el("button", {}, "加入");
+    b.disabled = !open;
+    line.appendChild(action(b, err, () => post("/api/room/join", { room: r.id, nick: nick.value })));
+    panel.appendChild(line);
+  }
+  if (!s.rooms.length) panel.appendChild(el("div", { class: "line" }, "还没有房间，开一个吧"));
+  const size = sizeSelect(s.room.sizes, 6);
+  const full = s.rooms.length >= s.max_rooms;
+  const btn = el("button", { class: "primary" }, full ? `已有 ${s.max_rooms} 个房间` : "开新房间");
+  btn.disabled = full;
+  action(btn, err, () => post("/api/room/create", { nick: nick.value, size: Number(size.value) }));
   panel.append(row(nick, size, btn), err);
 }
 
@@ -159,7 +174,7 @@ function renderLobby(s) {
   const r = s.room, me = s.me, err = errLine();
   if (s.discuss.available) renderDiscuss(s);
   const ai = r.ai > 0 ? ` · 🤖${r.ai} ${r.ai_ready ? "✅" : "准备中…"}` : "";
-  panel.appendChild(el("div", { class: "line" }, `${r.size}人局 · 房主 ${r.host} · 👥 ${r.members.join("、")}${ai}`));
+  panel.appendChild(el("div", { class: "line" }, `#${r.id} · ${r.size}人局 · 房主 ${r.host} · 👥 ${r.members.join("、")}${ai}`));
   if (!me.member) {
     const nick = nickInput();
     panel.append(row(nick, action(el("button", { class: "primary" }, "加入"), err,
@@ -242,7 +257,7 @@ async function tickOnce() {
   updateStartBtn(s);
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
-  const key = JSON.stringify([st, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
+  const key = JSON.stringify([st, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
                              s.discuss.available, s.discuss.busy]);
   if (key !== panelKey) {
     panelKey = key;
@@ -307,9 +322,9 @@ function updateStartBtn(s) {
   const st = s.room.state, me = s.me;
   startAction = null;
   let label = "▶ 开局", tip = "";
-  if (st === "idle") startAction = "create";
+  if (st === "idle" && s.rooms.length < s.max_rooms) startAction = "create";
+  else if (st === "idle") tip = "房间数已满，请加入已有房间";
   else if (st === "lobby" && me.host) startAction = "start";
-  else if (st === "lobby" && !me.member) { startAction = "join"; label = "▶ 加入"; }
   else if (st === "lobby") tip = "只有房主可以开局";
   else tip = "游戏进行中";
   startBtn.textContent = label;
