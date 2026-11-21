@@ -24,6 +24,9 @@ ACCESS_TEAM = "ptao"
 AUD_FILE = Path(__file__).with_name("access_aud.txt")
 HERE = Path(__file__).parent
 FAKE = "--fake" in sys.argv   # 测试用：AI 随机行动，不花额度
+# 网页版本号：网页文件一改就变。手机上开着的旧页面发现版本变了会自动刷新
+import hashlib
+VERSION = hashlib.md5(b"".join((HERE / "web" / f).read_bytes() for f in ("index.html", "app.js"))).hexdigest()[:8]
 
 
 # ---------- Cloudflare Access 登录凭证检查 ----------
@@ -418,7 +421,7 @@ class Controller:
                          "ai": max(0, self.size - len(self.members)),
                          "ai_ready": (not self.checking) and bool(self.model_ok)
                                      and time.time() - self.model_time < self.CACHE_SECONDS},
-                "game": self.game_no, "pending": p, "events": evs, "total": len(self.events),
+                "v": VERSION, "game": self.game_no, "pending": p, "events": evs, "total": len(self.events),
             }
 
 

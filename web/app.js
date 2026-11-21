@@ -3,7 +3,21 @@
 const log = document.getElementById("log");
 const panel = document.getElementById("panel");
 const statusEl = document.getElementById("status");
-let meSeat = null, meRole = null;      // 我的座位和身份（用来在座位表里标蓝）
+let meSeat = null, meRole = null, loadedVersion = null;
+// iPhone：键盘弹出/收起时，让页面高度跟着可见区域走，并把被推走的页面拉回顶部
+function fitViewport() {
+  const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  document.body.style.height = h + "px";
+  window.scrollTo(0, 0);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", fitViewport);
+  window.visualViewport.addEventListener("scroll", fitViewport);
+}
+window.addEventListener("resize", fitViewport);
+window.addEventListener("orientationchange", fitViewport);
+document.addEventListener("focusout", () => setTimeout(fitViewport, 50));   // 键盘收起
+fitViewport();      // 我的座位和身份（用来在座位表里标蓝）
 let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0, draftQ = "", draftSeat = "0";
 
 function el(tag, attrs = {}, text) {
@@ -213,6 +227,9 @@ async function tickOnce() {
     game = s.game; log.textContent = ""; shown = 0; panelKey = ""; follow = true;
     if (!firstLoad) { tickAgain = true; return; }
   }
+  // 服务器更新了网页：不在你的回合时自动刷新，换上新版本
+  if (loadedVersion === null) loadedVersion = s.v;
+  else if (s.v !== loadedVersion && !s.pending) { location.reload(); return; }
   meSeat = s.me.seat; meRole = s.me.role;
   for (const ev of s.events) {
     if (ev.i < shown) continue;          // 已经显示过的消息不再重复显示
