@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""狼人杀（终端版）：你 + Claude + Codex + agy + 2 个 Haiku 机器人，共 6 人。
+"""狼人杀（终端版）：你 + 5 个 AI 模型，共 6 人。AI 从模型池里随机抽取，也可以指定。
 
-运行：  python3 werewolf.py
-测试：  python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，用来快速检查规则）
+运行：      python3 werewolf.py
+指定模型：  python3 werewolf.py --players Claude-Opus,Gemini-Argon   （不够 5 个的随机补齐）
+看模型池：  python3 werewolf.py --list
+测试：      python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，不花额度）
 """
 import json, random, re, subprocess, sys, tempfile, time, argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-# ---------- 玩家与角色配置 ----------
-# kind 决定用哪个命令行工具来"思考"；model 是该工具使用的模型
-PLAYERS = [
-    {"name": "你",      "kind": "human"},
-    {"name": "Claude",  "kind": "claude", "model": "sonnet"},
-    {"name": "Codex",   "kind": "codex"},
-    {"name": "agy",     "kind": "agy",    "model": "Gemini 4 Argon (High)"},
-    {"name": "Haiku-1", "kind": "claude", "model": "haiku"},
-    {"name": "Haiku-2", "kind": "claude", "model": "haiku"},
+# ---------- 模型池 ----------
+# name 是游戏里显示的玩家名；kind 决定用哪个命令行工具；model 是传给该工具的模型名
+# 想加减模型，直接改这个列表即可（模型名可用 `agy models`、`claude --help` 查）
+MODEL_POOL = [
+    {"name": "Claude-Opus",     "kind": "claude", "model": "opus"},
+    {"name": "Claude-Sonnet",   "kind": "claude", "model": "sonnet"},
+    {"name": "Claude-Haiku",    "kind": "claude", "model": "haiku"},
+    {"name": "GPT-6.2-Sol",     "kind": "codex",  "model": "gpt-6.2-sol"},
+    {"name": "GPT-6.1-Terra",   "kind": "codex",  "model": "gpt-6.1-terra"},
+    {"name": "GPT-5.6-Luna",    "kind": "codex",  "model": "gpt-5.6-luna"},
+    {"name": "Gemini-Argon",    "kind": "agy",    "model": "Gemini 4 Argon (High)"},
+    {"name": "Gemini-Neon",     "kind": "agy",    "model": "Gemini 4 Neon (Medium)"},
+    {"name": "Gemini-Hydrogen", "kind": "agy",    "model": "Gemini 4 Hydrogen (Medium)"},
+    {"name": "Gemini-Flash",    "kind": "agy",    "model": "Gemini 3.8 Flash (Medium)"},
+    {"name": "GPT-OSS",         "kind": "agy",    "model": "GPT-OSS 120B (Medium)"},
 ]
+HUMAN = {"name": "你", "kind": "human"}
 ROLES = ["狼人", "狼人", "预言家", "女巫", "村民", "村民"]
 
 RULES = """你正在参加一局 6 人狼人杀（中文进行）。
@@ -35,17 +45,16 @@ class Quit(Exception):
 
 
 class Game:
-    def __init__(self, fake=False, auto=False):
+    def __init__(self, entries, spare, fake=False, auto=False):
         self.fake, self.auto = fake, auto
-        seats = PLAYERS[:]
+        self.spare = spare             # 没被抽中的模型，中途有人掉线时用来替补
+        seats = entries[:]
         random.shuffle(seats)          # 随机座位
         roles = ROLES[:]
         random.shuffle(roles)          # 随机发身份
         self.players = []
         for i, (p, r) in enumerate(zip(seats, roles), start=1):
             self.players.append({**p, "seat": i, "role": r, "alive": True, "notes": []})
-        if auto and not fake:  # 真实测试：你的座位由 Haiku 代打
-            self.human().update(kind="claude", model="haiku")
         self.public = []               # 所有人都能看到的公开记录
         self.antidote = self.poison = True
         self.day = 0
@@ -61,10 +70,10 @@ class Game:
         return [p for p in self.players if p["alive"]]
 
     def human(self):
-        return next(p for p in self.players if p["name"] == "你")
+        return next((p for p in self.players if p["kind"] == "human"), None)
 
     def is_human(self, p):
-        return p["kind"] == "human" and not self.auto
+        return p["kind"] == "human"
 
     def log(self, text):
         with open(self.logfile, "a") as f:
@@ -136,42 +145,41 @@ class Game:
         return self.on_failure(p, f"两次回复都无效：{raw[:200]}", lambda: self.ask_ai(p, task, valid, allow_none, speech))
 
     def call_ai(self, p, prompt):
-        """调用对应的命令行工具，返回它的文字回复"""
+        """调用对应的命令行工具，返回它的文字回复；失败就停下来问你"""
         while True:
-            try:
-                if p["kind"] == "claude":
-                    cmd = ["claude", "-p", "--model", p["model"], "--tools", ""]
-                    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                                       timeout=AI_TIMEOUT, cwd=self.workdir)
-                    out = r.stdout
-                elif p["kind"] == "codex":
-                    outf = Path(self.workdir) / "codex-last.txt"
-                    outf.unlink(missing_ok=True)
-                    cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
-                           "-C", self.workdir, "-o", str(outf), "-"]
-                    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=AI_TIMEOUT)
-                    out = outf.read_text() if outf.exists() else ""
-                else:  # agy
-                    cmd = ["agy", "-p", prompt, "--model", p["model"], "--print-timeout", "0"]
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=AI_TIMEOUT, cwd=self.workdir)
-                    out = r.stdout
-                if r.returncode == 0 and out.strip():
-                    return out
-                err = f"退出码 {r.returncode}；错误输出：{(r.stderr or '').strip()[-300:]}"
-            except subprocess.TimeoutExpired:
-                err = f"超过 {AI_TIMEOUT} 秒没回复"
-            # 调用失败：报告原始错误，让你决定重试还是退出
-            self.on_failure(p, err, None)
+            ok, out = run_cli(p, prompt, AI_TIMEOUT, self.workdir)
+            if ok:
+                return out
+            self.on_failure(p, out, None)   # 你选 r 会重试；选 s 后 p 已换成新模型，再循环一次
 
     def on_failure(self, p, err, retry):
         print(f"\n⚠️  {self.label(p)} 调用失败：{err}")
         self.log(f"[失败 {self.label(p)}] {err}")
         while True:
-            c = input("   r=重试  q=退出游戏：").strip().lower()
+            c = input("   r=重试  s=换一个模型接替  q=退出游戏：").strip().lower()
             if c == "q":
                 raise Quit()
-            if c == "r":
+            if c == "s" and not self.substitute(p):
+                continue
+            if c in ("r", "s"):
                 return retry() if retry else None
+
+    def substitute(self, p):
+        """从备用模型里找一个可用的，接替 p 的座位（身份和记忆都保留）"""
+        random.shuffle(self.spare)
+        while self.spare:
+            cand = self.spare.pop()
+            print(f"   检查 {cand['name']} 是否可用…", flush=True)
+            ok, err = run_cli(cand, PING, 90, self.workdir)
+            if not ok:
+                print(f"   ⚠️  {cand['name']} 不可用：{err[-150:]}")
+                continue
+            old = self.label(p)
+            p.update(name=cand["name"], kind=cand["kind"], model=cand["model"])
+            self.say(f"📢 {old} 掉线，由 {self.label(p)} 接替（身份不变）")
+            return True
+        print("   没有可用的备用模型了。")
+        return False
 
     @staticmethod
     def parse_json(raw):
@@ -306,7 +314,8 @@ class Game:
         self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
         self.log("身份（秘密）：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players))
         me = self.human()
-        self.tell(me, f"你的身份是：{me['role']}")
+        if me:
+            self.tell(me, f"你的身份是：{me['role']}")
         for w in (p for p in self.players if p["role"] == "狼人"):
             mates = [self.label(m) for m in self.players if m["role"] == "狼人" and m is not w]
             self.tell(w, f"你的狼队友是：{'、'.join(mates)}")
@@ -327,9 +336,89 @@ class Game:
         print(f"完整记录（含所有私密信息）：{self.logfile}")
 
 
+PING = '只回复 JSON：{"ok": 1}。不要运行任何命令。'
+
+
+def run_cli(p, prompt, timeout, workdir):
+    """真正调用命令行工具。返回 (是否成功, 回复文字或错误信息)"""
+    try:
+        if p["kind"] == "claude":
+            cmd = ["claude", "-p", "--model", p["model"], "--tools", ""]
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout, cwd=workdir)
+            out = r.stdout
+        elif p["kind"] == "codex":
+            # 每次用不同的输出文件，避免同时检查多个模型时互相覆盖
+            outf = Path(tempfile.mkstemp(dir=workdir, suffix=".txt")[1])
+            cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+                   "-m", p["model"], "-C", workdir, "-o", str(outf), "-"]
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout)
+            out = outf.read_text()
+            outf.unlink(missing_ok=True)
+        else:  # agy
+            cmd = ["agy", "-p", prompt, "--model", p["model"], "--print-timeout", "0"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=workdir)
+            out = r.stdout
+        if r.returncode == 0 and out.strip():
+            return True, out
+        err = (r.stderr or "").strip() or (r.stdout or "").strip()
+        return False, f"退出码 {r.returncode}；错误输出：{err[-300:]}"
+    except subprocess.TimeoutExpired:
+        return False, f"超过 {timeout} 秒没回复"
+
+
+def find_models(names):
+    """把 --players 里写的名字（不分大小写）对应到模型池"""
+    by_name = {m["name"].lower(): m for m in MODEL_POOL}
+    chosen = []
+    for n in names:
+        if n.lower() not in by_name:
+            sys.exit(f"模型池里没有 {n}。用 --list 查看可用名字。")
+        chosen.append(by_name[n.lower()])
+    return chosen
+
+
+def pick_players(wanted, need, fake):
+    """先用你指定的，再随机补齐；每个都先测一下能不能用，不能用的提示并跳过"""
+    workdir = tempfile.mkdtemp(prefix="werewolf-check-")
+    queue = wanted[:]                                   # 指定的排在前面
+    rest = [m for m in MODEL_POOL if m not in wanted]
+    random.shuffle(rest)
+    queue += rest
+    ok_list = []
+    while len(ok_list) < need and queue:
+        batch, queue = queue[:need - len(ok_list)], queue[need - len(ok_list):]
+        if fake:                                        # 测试模式不真的调用
+            ok_list += batch
+            continue
+        print("检查模型是否可用：" + "、".join(m["name"] for m in batch), flush=True)
+        with ThreadPoolExecutor(len(batch)) as ex:      # 同时检查，节省时间
+            results = list(ex.map(lambda m: run_cli(m, PING, 90, workdir), batch))
+        for m, (ok, err) in zip(batch, results):
+            if ok:
+                ok_list.append(m)
+            else:
+                first = next((l for l in err.splitlines() if "ERROR" in l or "error" in l), err)
+                print(f"⚠️  {m['name']} 不可用，本局不参加：{first[-200:]}")
+    if len(ok_list) < need:
+        sys.exit(f"可用模型只有 {len(ok_list)} 个，不够 {need} 个，游戏无法开始。")
+    return ok_list, queue                               # queue 里剩下的是没测过的备用模型
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--players", default="", help="指定参加的模型，逗号分隔，不够的随机补齐")
+    ap.add_argument("--list", action="store_true", help="列出模型池")
     ap.add_argument("--fake", action="store_true", help="AI 随机行动（不花额度，测试用）")
-    ap.add_argument("--auto", action="store_true", help="你的座位也自动行动（测试用；不加 --fake 时由 Haiku 代打）")
+    ap.add_argument("--auto", action="store_true", help="你的座位也由 AI 代打（测试用）")
     a = ap.parse_args()
-    Game(fake=a.fake, auto=a.auto).run()
+    if a.list:
+        for m in MODEL_POOL:
+            print(f"  {m['name']:<16} ({m['kind']}: {m['model']})")
+        sys.exit()
+    need = 6 if a.auto else 5
+    wanted = find_models([n.strip() for n in a.players.split(",") if n.strip()])
+    if len(wanted) > need:
+        sys.exit(f"最多指定 {need} 个模型。")
+    chosen, spare = pick_players(wanted, need, a.fake)
+    entries = chosen if a.auto else chosen + [HUMAN]
+    Game(entries, spare, fake=a.fake, auto=a.auto).run()
