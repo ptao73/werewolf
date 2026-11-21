@@ -85,7 +85,7 @@ class Game:
         random.shuffle(roles)          # 随机发身份
         self.players = []
         for i, (p, r) in enumerate(zip(seats, roles), start=1):
-            self.players.append({**p, "seat": i, "role": r, "alive": True, "notes": []})
+            self.players.append({**p, "seat": i, "role": r, "alive": True, "notes": [], "reasons": []})
         self.rules = rules_text(self.n)
         self.public = []               # 所有人都能看到的公开记录
         self.antidote = self.poison = True
@@ -93,6 +93,8 @@ class Game:
         self.day = 0
         self.night_now = False
         self.deferred = []             # 夜里发生、要等天亮才公布的消息
+        self.discussion = []           # 赛后讨论记录
+        self.result = ""               # 游戏结果（赛后讨论用）
         self.lock = threading.Lock()   # 同时投票时保护共享数据
         Path(__file__).with_name("logs").mkdir(exist_ok=True)
         self.logfile = Path(__file__).with_name("logs") / f"game-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
@@ -182,7 +184,8 @@ class Game:
             "【只有你知道的信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
             f"【现在轮到你】{task}\n"
         )
-        fmt = {"speech": "你的发言" if speech else "", "target": "座位号数字" if valid else 0}
+        fmt = {"speech": "你的发言" if speech else "", "target": "座位号数字" if valid else 0,
+               "reason": "你这样做的真实理由（不公开，赛后讨论才会用到，不超过40字）"}
         if valid:
             prompt += f"target 只能是 {valid}" + ("，或 0 表示不选" if allow_none else "") + "。\n"
         prompt += f"不要运行任何命令或工具，只用一行 JSON 回复，格式：{json.dumps(fmt, ensure_ascii=False)}"
@@ -194,6 +197,11 @@ class Game:
                                    and (int(data["target"]) in valid or (allow_none and int(data["target"]) == 0)))
             if data is not None and ok_t:
                 t = int(data.get("target") or 0) if valid else 0
+                reason = str(data.get("reason", "")).strip()[:120]
+                when = f"第{self.day}{'夜' if self.night_now else '天'}"
+                act = f"选了 {t}号" if t else ("不选" if valid else "发言")
+                p["reasons"].append(f"{when}｜{task}｜{act}｜理由：{reason or '（没写）'}")
+                self.log(f"[理由 {self.real_label(p)}] {when} {act}：{reason}")
                 return str(data.get("speech", "")).strip(), t
             self.log(f"[无效回复 {self.real_label(p)}] {raw[:300]}")
             prompt += "\n（上次回复格式无效，请严格按 JSON 格式重新回复。）"
@@ -268,6 +276,64 @@ class Game:
         if not self.anonymous:
             self.emit("   没有可用的备用模型了。", "warn")
         return False
+
+    def explain(self, p, question, asker="玩家"):
+        """赛后讨论：让 AI 根据完整记录和它自己当时写下的理由，诚实解释它的想法"""
+        reveal = "、".join(f"{self.real_label(x)}={x['role']}" for x in self.players)
+        with self.lock:
+            public = "\n".join(self.public)
+        prompt = (
+            f"{self.rules}\n\n游戏已经结束：{self.result}\n身份揭晓：{reveal}\n"
+            f"你是 {self.real_label(p)}，身份：{p['role']}。\n\n"
+            "【公开记录】\n" + (public or "（无）") + "\n\n"
+            "【你在游戏中的私密信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
+            "【你当时每一步写下的理由】\n" + ("\n".join(p["reasons"]) or "（没有记录）") + "\n\n"
+            "【赛后讨论记录】\n" + ("\n".join(self.discussion) or "（无）") + "\n\n"
+            f"现在是赛后讨论，{asker}问你：{question}\n"
+            "游戏已结束，不需要再伪装。请根据上面的记录，尤其是你当时写下的理由，诚实解释你的想法；"
+            "如果记录里没有写到，就说明是现在回想推测的。用中文，不超过150字，直接回答，不要 JSON，不要运行任何命令。"
+        )
+        if self.fake:
+            ans = f"（测试回答）我是{p['seat']}号，我的理由记录有 {len(p['reasons'])} 条。"
+        else:
+            ans = self.call_ai(p, prompt).strip()
+        self.discussion.append(f"{asker} 问 {self.real_label(p)}：{question}\n{self.real_label(p)} 回答：{ans}")
+        self.log(f"[赛后讨论] {asker} 问 {self.real_label(p)}：{question}\n  回答：{ans}")
+        return ans
+
+    def ai_seats(self):
+        return [p for p in self.players if not self.is_human(p)]
+
+    def discuss_terminal(self):
+        """终端版赛后讨论：输入 "座位号 问题" 或 "all 问题"，直接回车结束"""
+        print("\n💬 赛后讨论：输入「座位号 问题」问某位 AI（例：5 你为什么毒3号？），"
+              "「all 问题」问所有 AI，直接回车结束讨论。", flush=True)
+        while True:
+            restore_tty()
+            try:
+                line = clean_input(input("提问：")).strip()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if not line:
+                return
+            line = unicodedata.normalize("NFKC", line)
+            m = re.match(r"^(all|全部|所有)\s*(.+)$", line, re.I) or re.match(r"^(\d+)\s*号?\s*(.+)$", line)
+            if not m:
+                print("   格式：座位号 问题（例：5 你为什么毒3号？）", flush=True)
+                continue
+            who, q = m.group(1), m.group(2).strip()
+            targets = self.ai_seats() if not who.isdigit() else [x for x in self.ai_seats() if x["seat"] == int(who)]
+            if not targets:
+                print("   这个座位不是 AI（或不存在）。", flush=True)
+                continue
+            for t in targets:
+                print(f"   …{self.real_label(t)} 思考中", flush=True)
+                try:
+                    ans = self.explain(t, q, "你")
+                except Quit:
+                    print("   已取消。", flush=True)
+                    break
+                print(f"🤖 {self.real_label(t)}：{ans}", flush=True)
 
     @staticmethod
     def parse_json(raw):
@@ -464,10 +530,13 @@ class Game:
                 self.day_phase(dead)
                 if self.winner():
                     break
-            self.say(f"\n🏁 游戏结束：{self.winner()}阵营获胜！")
+            self.result = f"{self.winner()}阵营获胜"
+            self.say(f"\n🏁 游戏结束：{self.result}！")
         except Quit:
+            self.result = "游戏中途退出"
             self.say("\n游戏已退出。")
         except (KeyboardInterrupt, EOFError):
+            self.result = "游戏中途被中断"
             self.say("\n游戏被中断。")
         self.emit("身份揭晓：\n" + "\n".join(f"   {self.real_label(p)}：{p['role']}" for p in self.players), "reveal")
         self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "logpath")
@@ -593,9 +662,11 @@ if __name__ == "__main__":
         except NotEnoughModels as e:
             sys.exit(str(e))
         entries = chosen if a.auto else chosen + [HUMAN]
-        Game(entries, spare, fake=a.fake, auto=a.auto).run()
+        g = Game(entries, spare, fake=a.fake, auto=a.auto)
+        g.run()
         if a.auto:          # 全自动测试模式：只玩一局
             break
+        g.discuss_terminal()
         restore_tty()
         try:
             while (c := clean_input(input("\n🔁 n=下一局  q=结束：")).strip().lower()) not in ("n", "q"):

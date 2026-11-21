@@ -3,7 +3,7 @@
 const log = document.getElementById("log");
 const panel = document.getElementById("panel");
 const statusEl = document.getElementById("status");
-let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0;
+let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0, draftQ = "", draftSeat = "0";
 
 function el(tag, attrs = {}, text) {
   const e = document.createElement(tag);
@@ -104,8 +104,30 @@ function renderIdle(s) {
   panel.append(row(nick, size, btn), err);
 }
 
+// ---------- 赛后讨论 ----------
+function renderDiscuss(s) {
+  const d = s.discuss, err = errLine();
+  panel.appendChild(el("div", { class: "task" }, "💬 赛后讨论：问问 AI 当时是怎么想的"));
+  const sel = el("select");
+  sel.appendChild(el("option", { value: "0" }, "所有 AI"));
+  for (const x of d.seats) sel.appendChild(el("option", { value: String(x.seat) }, x.label));
+  sel.value = draftSeat;
+  sel.onchange = () => (draftSeat = sel.value);
+  const q = el("input", { type: "text", maxlength: "200", placeholder: "例：你为什么毒 3 号？" });
+  q.value = draftQ;                      // 页面刷新时保留你打了一半的问题
+  q.oninput = () => (draftQ = q.value);
+  const btn = el("button", { class: "primary" }, d.busy ? "回答中…" : "提问");
+  btn.disabled = d.busy;
+  action(btn, err, async () => {
+    await post("/api/discuss", { seat: Number(sel.value), question: q.value });
+    draftQ = "";
+  });
+  panel.append(row(sel, q, btn), err, el("hr"));
+}
+
 function renderLobby(s) {
   const r = s.room, me = s.me, err = errLine();
+  if (s.discuss.available) renderDiscuss(s);
   panel.appendChild(el("div", { class: "task" },
     `房间：${r.size} 人局 · 房主 ${r.host} · 已加入 ${r.members.length} 人，开始后由 ${r.ai} 个 AI 补位`));
   panel.appendChild(el("div", { class: "members" }, "👥 " + r.members.join("、")));
@@ -169,7 +191,8 @@ async function tick() {
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
-  const key = JSON.stringify([st, s.room.members, s.room.size, s.me, s.pending && s.pending.id, game]);
+  const key = JSON.stringify([st, s.room.members, s.room.size, s.me, s.pending && s.pending.id, game,
+                             s.discuss.available, s.discuss.busy]);
   if (key !== panelKey) {
     panelKey = key;
     panel.textContent = "";

@@ -146,6 +146,8 @@ class Controller:
         self.answers = {}              # uid → 回答
         self.next_id = 0
         self.stop_flag = False
+        self.last_game = None          # 刚结束的那一局（赛后讨论用）
+        self.asking = False            # 赛后讨论：同一时间只问一个问题
 
     # ----- 游戏线程用 -----
     def add(self, text, kind, to=None):
@@ -247,6 +249,7 @@ class Controller:
             self.state, self.players = "running", set(self.members)
             self.events, self.game_no = [], self.game_no + 1
             self.pending, self.answers, self.stop_flag = {}, {}, False
+            self.last_game, self.asking = None, False
             size = self.size
         threading.Thread(target=self.run_game, args=(humans, size), daemon=True).start()
         return None
@@ -265,6 +268,8 @@ class Controller:
             for line in game_log:
                 g.log("[模型检查] " + line)
             g.run()
+            with self.cond:
+                self.last_game = g
         except w.NotEnoughModels as e:
             self.add(f"⚠️ {e}", "warn")
         except Exception:
@@ -274,6 +279,46 @@ class Controller:
             with self.cond:
                 self.state = "lobby" if self.host in self.members else "idle"
                 self.pending, self.stop_flag = {}, False
+                self.cond.notify_all()
+
+    def discuss(self, uid, seat, question):
+        """赛后讨论：房间里的人问某位 AI（seat=0 表示问所有 AI）"""
+        question = w.clean_input(str(question or "")).strip()[:200]
+        with self.cond:
+            g = self.last_game
+            if self.state != "lobby" or not g or uid not in self.members:
+                return "现在不能提问（只能在一局结束后、下一局开始前）"
+            if self.asking:
+                return "上一个问题还在回答中，请稍等"
+            if not question:
+                return "请输入问题"
+            ais = g.ai_seats()
+            targets = ais if seat == 0 else [p for p in ais if p["seat"] == seat]
+            if not targets:
+                return "这个座位不是 AI"
+            self.asking = True
+            nick = self.members[uid]
+        threading.Thread(target=self.run_discuss, args=(g, nick, targets, question, seat), daemon=True).start()
+        return None
+
+    def run_discuss(self, g, nick, targets, question, seat):
+        try:
+            who = "所有 AI" if seat == 0 else g.real_label(targets[0])
+            self.add(f"❓ {nick} 问 {who}：{question}", "public")
+            for t in targets:
+                self.add(f"   …{g.real_label(t)} 思考中", "thinking")
+                try:
+                    ans = g.explain(t, question, nick)
+                except w.Quit:
+                    self.add(f"⚠️ {g.real_label(t)} 无法回答（AI 调用失败）", "warn")
+                    continue
+                self.add(f"🤖 {g.real_label(t)}：{ans}", "public")
+        except Exception:
+            self.add("⚠️ 回答时程序出错。", "warn")
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+        finally:
+            with self.cond:
+                self.asking = False
                 self.cond.notify_all()
 
     def stop(self, uid):
@@ -296,7 +341,11 @@ class Controller:
             if p:
                 p = dict(p, seconds_left=max(0, int(p["deadline"] - time.time())))
                 p.pop("deadline", None)
+            g = self.last_game
+            discuss = {"available": bool(g and self.state == "lobby" and member), "busy": self.asking,
+                       "seats": [{"seat": p["seat"], "label": g.real_label(p)} for p in g.ai_seats()] if g else []}
             return {
+                "discuss": discuss,
                 "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game},
                 "room": {"state": self.state, "size": self.size, "sizes": SIZES,
                          "host": self.members.get(self.host), "members": list(self.members.values()),
@@ -386,6 +435,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/room/start": lambda: CTL.start(uid),
             "/api/stop": lambda: CTL.stop(uid),
             "/api/answer": lambda: CTL.give_answer(uid, data),
+            "/api/discuss": lambda: CTL.discuss(uid, data.get("seat") if isinstance(data.get("seat"), int) else -1,
+                                                data.get("question")),
         }
         act = actions.get(urlsplit(self.path).path)
         if not act:
