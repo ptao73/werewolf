@@ -98,6 +98,7 @@ class Game:
         self.lock = threading.Lock()   # 同时投票时保护共享数据
         Path(__file__).with_name("logs").mkdir(exist_ok=True)
         self.logfile = Path(__file__).with_name("logs") / f"game-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
+        self.notedir = self.logfile.with_suffix("")   # 每局一个文件夹，放各 AI 的思考笔记本
         self.workdir = tempfile.mkdtemp(prefix="werewolf-")  # AI 在空目录里运行，碰不到你的文件
 
     # ---------- 小工具 ----------
@@ -182,10 +183,12 @@ class Game:
             f"存活玩家：{'、'.join(self.label(a) for a in self.alive())}\n\n"
             "【公开记录】\n" + (public or "（无）") + "\n\n"
             "【只有你知道的信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
+            "【你的思考笔记本（只有你自己能看到，是你之前每一步记下的想法，请保持思路连贯）】\n"
+            + ("\n".join(p["reasons"]) or "（还没有）") + "\n\n"
             f"【现在轮到你】{task}\n"
         )
         fmt = {"speech": "你的发言" if speech else "", "target": "座位号数字" if valid else 0,
-               "reason": "你这样做的真实理由（不公开，赛后讨论才会用到，不超过40字）"}
+               "thinking": "你的思考笔记（只有你自己看得到，不公开）：你目前对其他玩家的判断、这样做的理由、接下来的打算，不超过150字"}
         if valid:
             prompt += f"target 只能是 {valid}" + ("，或 0 表示不选" if allow_none else "") + "。\n"
         prompt += f"不要运行任何命令或工具，只用一行 JSON 回复，格式：{json.dumps(fmt, ensure_ascii=False)}"
@@ -197,11 +200,10 @@ class Game:
                                    and (int(data["target"]) in valid or (allow_none and int(data["target"]) == 0)))
             if data is not None and ok_t:
                 t = int(data.get("target") or 0) if valid else 0
-                reason = str(data.get("reason", "")).strip()[:120]
+                thinking = str(data.get("thinking") or data.get("reason") or "").strip()[:400]
                 when = f"第{self.day}{'夜' if self.night_now else '天'}"
                 act = f"选了 {t}号" if t else ("不选" if valid else "发言")
-                p["reasons"].append(f"{when}｜{task}｜{act}｜理由：{reason or '（没写）'}")
-                self.log(f"[理由 {self.real_label(p)}] {when} {act}：{reason}")
+                self.write_note(p, f"{when}｜{task}｜{act}\n  思考：{thinking or '（没写）'}")
                 return str(data.get("speech", "")).strip(), t
             self.log(f"[无效回复 {self.real_label(p)}] {raw[:300]}")
             prompt += "\n（上次回复格式无效，请严格按 JSON 格式重新回复。）"
@@ -278,7 +280,7 @@ class Game:
         return False
 
     def explain(self, p, question, asker="玩家"):
-        """赛后讨论：让 AI 根据完整记录和它自己当时写下的理由，诚实解释它的想法"""
+        """赛后讨论：让 AI 根据完整记录和它自己的思考笔记本，诚实解释它的想法"""
         reveal = "、".join(f"{self.real_label(x)}={x['role']}" for x in self.players)
         with self.lock:
             public = "\n".join(self.public)
@@ -287,19 +289,32 @@ class Game:
             f"你是 {self.real_label(p)}，身份：{p['role']}。\n\n"
             "【公开记录】\n" + (public or "（无）") + "\n\n"
             "【你在游戏中的私密信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
-            "【你当时每一步写下的理由】\n" + ("\n".join(p["reasons"]) or "（没有记录）") + "\n\n"
+            "【你的思考笔记本（游戏中每一步当时记下的想法）】\n" + ("\n".join(p["reasons"]) or "（没有记录）") + "\n\n"
             "【赛后讨论记录】\n" + ("\n".join(self.discussion) or "（无）") + "\n\n"
             f"现在是赛后讨论，{asker}问你：{question}\n"
-            "游戏已结束，不需要再伪装。请根据上面的记录，尤其是你当时写下的理由，诚实解释你的想法；"
+            "游戏已结束，不需要再伪装。请根据上面的记录，尤其是你笔记本里当时的想法，诚实解释；"
             "如果记录里没有写到，就说明是现在回想推测的。用中文，不超过150字，直接回答，不要 JSON，不要运行任何命令。"
         )
         if self.fake:
-            ans = f"（测试回答）我是{p['seat']}号，我的理由记录有 {len(p['reasons'])} 条。"
+            ans = f"（测试回答）我是{p['seat']}号，我的笔记本有 {len(p['reasons'])} 条。"
         else:
             ans = self.call_ai(p, prompt).strip()
         self.discussion.append(f"{asker} 问 {self.real_label(p)}：{question}\n{self.real_label(p)} 回答：{ans}")
+        self.write_note(p, f"赛后讨论｜{asker} 问：{question}\n  回答：{ans}")
         self.log(f"[赛后讨论] {asker} 问 {self.real_label(p)}：{question}\n  回答：{ans}")
         return ans
+
+    def write_note(self, p, entry):
+        """把一条思考记进该座位的笔记本（内存里一份，文件里一份）"""
+        p["reasons"].append(entry)
+        self.log(f"[笔记 {self.real_label(p)}] {entry}")
+        with self.lock:
+            self.notedir.mkdir(parents=True, exist_ok=True)
+            f = self.notedir / f"{p['seat']:02d}号.md"
+            if not f.exists():
+                f.write_text(f"# {p['seat']}号 的思考笔记本（{p['role']}）\n\n")
+            with open(f, "a", errors="replace") as fh:
+                fh.write(f"- [{self.real_label(p)}] {entry}\n")
 
     def ai_seats(self):
         return [p for p in self.players if not self.is_human(p)]
