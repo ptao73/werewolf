@@ -27,9 +27,20 @@ python3 werewolf.py --auto                             # all-AI game
 - Lines marked 🔒 are private to you. Full game records (incl. secrets) go to `logs/`.
 - Edit `MODEL_POOL` at the top of `werewolf.py` to add or remove models.
 
-## Web version
-`server.py` serves a phone-friendly page on `127.0.0.1:8010` (same game rules, imports `werewolf.py`).
+## Web version (multiplayer)
+`server.py` serves a phone-friendly page on `127.0.0.1:8010` (same rules engine, imports `werewolf.py`).
 Public at https://werewolf.potato73.win via a Cloudflare Tunnel, protected by Cloudflare Access.
-The server itself also verifies the Access JWT (team + AUD from `access_aud.txt`, not in git);
-requests without a valid token get 403. Runs as the user service `werewolf-web.service`.
-`python3 server.py --fake` = test mode (AI moves at random, no quota).
+The server also verifies the Access JWT itself (team + AUD list in `access_aud.txt`, not in git);
+each player is identified by their Access login e-mail.
+
+- One room: the host creates it (6/8/9/12 players), others join with a nickname, the host starts;
+  empty seats are filled with randomly drawn AI models (a model may fill several seats).
+- In game everyone is only a seat number (AIs too); nicknames and models are revealed at the end.
+- Each human has 120 s per action; on timeout: speech = pass, vote = abstain, required pick = random.
+- Votes are simultaneous. AI failures are retried, then the seat is handed to a spare model.
+- Runs as the user service `werewolf-web.service`.
+- Test: `python3 server.py --fake --port 8011 --turn 3`, `python3 test_rules.py`.
+
+Roles: 6 = 2 wolves, seer, witch, 2 villagers; 8 = 3 wolves, seer, witch, hunter, 2 villagers;
+9 = 3 wolves, seer, witch, hunter, 3 villagers; 12 = 4 wolves, seer, witch, hunter, guard, 4 villagers.
+Terminal: `python3 werewolf.py --size 8`.

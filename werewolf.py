@@ -6,7 +6,7 @@
 看模型池：  python3 werewolf.py --list
 测试：      python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，不花额度）
 """
-import json, random, re, subprocess, sys, tempfile, time, argparse, termios, unicodedata
+import json, random, re, subprocess, sys, tempfile, threading, time, argparse, termios, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -28,14 +28,33 @@ MODEL_POOL = [
     {"name": "GPT-OSS",         "kind": "agy",    "model": "GPT-OSS 120B (Medium)"},
 ]
 HUMAN = {"name": "你", "kind": "human"}
-ROLES = ["狼人", "狼人", "预言家", "女巫", "村民", "村民"]
 
-RULES = """你正在参加一局 6 人狼人杀（中文进行）。
-角色：2 狼人、1 预言家、1 女巫、2 村民。
-- 夜晚：狼人共同杀一人；女巫有一瓶解药（救当晚被杀者，整局一次）和一瓶毒药（毒一人，整局一次），同一晚不能两瓶都用；预言家查验一人是好人还是狼人。
-- 白天：公布夜里死亡的人，存活者依次发言，然后同时投票放逐一人（平票则无人出局）。
-- 胜负：狼人全部出局 → 好人赢；狼人数 ≥ 好人数 → 狼人赢。
-这是游戏，狼人可以撒谎伪装。发言要简短自然（不超过 80 字），像真人玩家一样推理。"""
+# ---------- 各人数的角色配置 ----------
+ROLESETS = {
+    6:  ["狼人"] * 2 + ["预言家", "女巫"] + ["村民"] * 2,
+    8:  ["狼人"] * 3 + ["预言家", "女巫", "猎人"] + ["村民"] * 2,
+    9:  ["狼人"] * 3 + ["预言家", "女巫", "猎人"] + ["村民"] * 3,
+    12: ["狼人"] * 4 + ["预言家", "女巫", "猎人", "守卫"] + ["村民"] * 4,
+}
+
+
+def rules_text(n):
+    """根据人数生成给 AI 看的规则说明"""
+    roles = ROLESETS[n]
+    summary = "、".join(f"{roles.count(r)} {r}" for r in dict.fromkeys(roles))
+    lines = [f"你正在参加一局 {n} 人狼人杀（中文进行）。", f"角色：{summary}。",
+             "- 夜晚：狼人共同杀一人；女巫有一瓶解药（救当晚被杀者，整局一次）和一瓶毒药（毒一人，整局一次），"
+             "同一晚不能两瓶都用；预言家查验一人是好人还是狼人。"]
+    if "守卫" in roles:
+        lines.append("- 守卫：每晚守护一人（不能连续两晚守同一人），被守护的人不会被狼人杀死；"
+                     "但如果同一人同时被守护又被女巫救，仍然死亡。守卫挡不住毒药。")
+    if "猎人" in roles:
+        lines.append("- 猎人：出局时可以开枪带走一人；被女巫毒死则不能开枪。")
+    lines += ["- 白天：公布夜里死亡的人，存活者依次发言，然后同时投票放逐一人（平票则无人出局）。",
+              "- 胜负：狼人全部出局 → 好人赢；狼人数 ≥ 好人数 → 狼人赢。",
+              "这是游戏，狼人可以撒谎伪装。发言要简短自然（不超过 80 字），像真人玩家一样推理。"]
+    return "\n".join(lines)
+
 
 AI_TIMEOUT = 240  # 每次调用 AI 的最长等待秒数
 
@@ -49,71 +68,93 @@ class NotEnoughModels(Exception):
 
 
 class Game:
+    # 以下开关由网页多人版打开；终端版保持原样
+    anonymous = False      # True：只显示座位号，不显示名字/模型（AI 也只知道座位号）
+    parallel_votes = False # True：所有人同时投票
+    auto_recover = False   # True：AI 出错时自动重试/换模型，不停下来问
+
     def __init__(self, entries, spare, fake=False, auto=False):
         self.fake, self.auto = fake, auto
         self.spare = spare             # 没被抽中的模型，中途有人掉线时用来替补
+        self.n = len(entries)
+        if self.n not in ROLESETS:
+            raise ValueError(f"不支持 {self.n} 人局（只支持 {sorted(ROLESETS)} 人）")
         seats = entries[:]
         random.shuffle(seats)          # 随机座位
-        roles = ROLES[:]
+        roles = ROLESETS[self.n][:]
         random.shuffle(roles)          # 随机发身份
         self.players = []
         for i, (p, r) in enumerate(zip(seats, roles), start=1):
             self.players.append({**p, "seat": i, "role": r, "alive": True, "notes": []})
+        self.rules = rules_text(self.n)
         self.public = []               # 所有人都能看到的公开记录
         self.antidote = self.poison = True
+        self.last_guard = 0            # 守卫上一晚守的人
         self.day = 0
         self.night_now = False
-        self.deferred = []          # 夜里发生、要等天亮才公布的消息
+        self.deferred = []             # 夜里发生、要等天亮才公布的消息
+        self.lock = threading.Lock()   # 同时投票时保护共享数据
         Path(__file__).with_name("logs").mkdir(exist_ok=True)
-        self.logfile = Path(__file__).with_name("logs") / f"game-{datetime.now():%Y%m%d-%H%M%S}.log"
+        self.logfile = Path(__file__).with_name("logs") / f"game-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
         self.workdir = tempfile.mkdtemp(prefix="werewolf-")  # AI 在空目录里运行，碰不到你的文件
 
     # ---------- 小工具 ----------
     def label(self, p):
+        """游戏里显示的名字：匿名模式只有座位号"""
+        return f"{p['seat']}号" if self.anonymous else f"{p['seat']}号 {p['name']}"
+
+    def real_label(self, p):
+        """真实身份（写日志、赛后揭晓用）"""
         return f"{p['seat']}号 {p['name']}"
 
     def alive(self):
         return [p for p in self.players if p["alive"]]
 
+    def humans(self):
+        return [p for p in self.players if p["kind"] == "human"]
+
     def human(self):
-        return next((p for p in self.players if p["kind"] == "human"), None)
+        h = self.humans()
+        return h[0] if h else None
 
     def is_human(self, p):
         return p["kind"] == "human"
 
     def log(self, text):
-        with open(self.logfile, "a", errors="replace") as f:   # 万一有怪字符也不崩溃
+        with self.lock, open(self.logfile, "a", errors="replace") as f:   # 万一有怪字符也不崩溃
             f.write(text + "\n")
 
-    def emit(self, text, kind="info"):
-        """所有给你看的文字都从这里出去。kind: public 公开 / private 私密 / info 提示 / thinking 思考中"""
+    def emit(self, text, kind="info", to=None):
+        """所有给玩家看的文字都从这里出去。kind: public / private / info / thinking / warn / reveal
+        to=某个玩家 表示只给这个人看（终端版只有你一个人，所以直接打印）"""
         print(text, flush=True)
 
     def say(self, text):
-        """公开信息：打印到屏幕 + 写进公开记录"""
+        """公开信息：所有人可见 + 写进公开记录"""
         self.emit(text, "public")
-        self.public.append(text)
+        with self.lock:
+            self.public.append(text)
         self.log(text)
 
     def tell(self, p, text):
-        """私密信息：只有该玩家知道（如果是你，就打印出来）"""
+        """私密信息：只有该玩家知道"""
         p["notes"].append(text)
-        self.log(f"[私密→{self.label(p)}] {text}")
+        self.log(f"[私密→{self.real_label(p)}] {text}")
         if self.is_human(p):
-            self.emit(f"  🔒 {text}", "private")
+            self.emit(f"  🔒 {text}", "private", to=p)
 
     # ---------- 询问玩家 ----------
     def ask(self, p, task, choices=None, allow_none=False, speech=False):
         """让玩家做决定。返回 (发言文字, 选择的座位号或 0)"""
         valid = [c["seat"] for c in (choices or [])]
         if self.is_human(p):
-            return self.ask_human(task, choices, allow_none, speech)
+            return self.ask_human(p, task, choices, allow_none, speech)
         if self.fake:  # 测试模式：随机行动
             t = random.choice(valid + ([0] if allow_none else [])) if valid else 0
             return (f"（测试发言）我是{p['seat']}号。" if speech else ""), t
         return self.ask_ai(p, task, valid, allow_none, speech)
 
-    def ask_human(self, task, choices, allow_none, speech):
+    def ask_human(self, p, task, choices, allow_none, speech):
         restore_tty()
         print(f"\n👉 {task}")
         text = ""
@@ -132,10 +173,12 @@ class Game:
             print("   无效，请重新输入。")
 
     def ask_ai(self, p, task, valid, allow_none, speech):
+        with self.lock:
+            public = "\n".join(self.public)
         prompt = (
-            f"{RULES}\n\n你是 {self.label(p)}，身份：{p['role']}。\n"
+            f"{self.rules}\n\n你是 {self.label(p)}，身份：{p['role']}。\n"
             f"存活玩家：{'、'.join(self.label(a) for a in self.alive())}\n\n"
-            "【公开记录】\n" + ("\n".join(self.public) or "（无）") + "\n\n"
+            "【公开记录】\n" + (public or "（无）") + "\n\n"
             "【只有你知道的信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
             f"【现在轮到你】{task}\n"
         )
@@ -152,25 +195,32 @@ class Game:
             if data is not None and ok_t:
                 t = int(data.get("target") or 0) if valid else 0
                 return str(data.get("speech", "")).strip(), t
-            self.log(f"[无效回复 {self.label(p)}] {raw[:300]}")
+            self.log(f"[无效回复 {self.real_label(p)}] {raw[:300]}")
             prompt += "\n（上次回复格式无效，请严格按 JSON 格式重新回复。）"
-        # 两次都无效：不偷偷替它选，停下来问你
-        # 不显示回复内容：里面可能有身份或夜间行动（如女巫说要救谁），只写进日志，赛后可查
+        # 两次都无效。不显示回复内容：里面可能有身份或夜间行动（如女巫说要救谁），只写进日志，赛后可查
         return self.on_failure(p, "两次回复格式都无效（内容为保密不显示，已写入日志）",
-                               lambda: self.ask_ai(p, task, valid, allow_none, speech))
+                               lambda: self.ask_ai(p, task, valid, allow_none, speech), tries=2)
 
     def call_ai(self, p, prompt):
-        """调用对应的命令行工具，返回它的文字回复；失败就停下来问你"""
+        """调用对应的命令行工具，返回它的文字回复；失败就按设置处理"""
+        tries = 0
         while True:
             ok, out = run_cli(p, prompt, AI_TIMEOUT, self.workdir)
             if ok:
                 return out
-            self.on_failure(p, out, None)   # 你选 r 会重试；选 s 后 p 已换成新模型，再循环一次
+            tries += 1
+            self.on_failure(p, out, None, tries)   # 重试 / 换模型后再循环一次
 
-    def on_failure(self, p, err, retry):
+    def on_failure(self, p, err, retry, tries=1):
+        self.log(f"[失败 {self.real_label(p)}] {err}")
+        if self.auto_recover:
+            # 多人网页版：不停下来问。第一次失败先重试，再失败就换一个模型接替；都不行才结束本局
+            if tries >= 2 and not self.substitute(p):
+                self.say("⚠️ 有 AI 玩家出了故障且没有可用的替补模型，本局只能结束。")
+                raise Quit()
+            return retry() if retry else None
         who = "夜间某位玩家（保密）" if self.night_now else self.label(p)
         self.emit(f"\n⚠️  {who} 调用失败：{err}", "warn")
-        self.log(f"[失败 {self.label(p)}] {err}")
         while True:
             c = self.ask_failure()
             if c == "q":
@@ -187,24 +237,36 @@ class Game:
 
     def substitute(self, p):
         """从备用模型里找一个可用的，接替 p 的座位（身份和记忆都保留）"""
-        random.shuffle(self.spare)
-        while self.spare:
-            cand = self.spare.pop()
-            self.emit(f"   检查 {cand['name']} 是否可用…", "info")
+        while True:
+            with self.lock:
+                if not self.spare:
+                    break
+                random.shuffle(self.spare)
+                cand = self.spare.pop()
+            if not self.anonymous:
+                self.emit(f"   检查 {cand['name']} 是否可用…", "info")
             ok, err = run_cli(cand, PING, 90, self.workdir)
             if not ok:
-                self.emit(f"   ⚠️  {cand['name']} 不可用：{err[-150:]}", "warn")
+                self.log(f"[替补不可用 {cand['name']}] {err[-150:]}")
+                if not self.anonymous:
+                    self.emit(f"   ⚠️  {cand['name']} 不可用：{err[-150:]}", "warn")
                 continue
-            old = self.label(p)
+            old = self.real_label(p)
             p.update(name=cand["name"], kind=cand["kind"], model=cand["model"])
-            msg = f"📢 {old} 掉线，由 {self.label(p)} 接替（身份不变）"
+            self.log(f"[替补] {old} → {self.real_label(p)}")
+            if self.anonymous:   # 匿名模式不说是哪个座位、哪个模型
+                msg = "📢 有一位 AI 玩家出了故障，已换一个模型接替（身份不变）"
+            else:
+                msg = f"📢 {old} 掉线，由 {self.label(p)} 接替（身份不变）"
             if self.night_now:
                 self.deferred.append(msg)   # 夜里换人先不公布，天亮再说，避免暴露谁在夜里行动
-                self.emit("   已换人接替，天亮后公布。", "info")
+                if not self.anonymous:
+                    self.emit("   已换人接替，天亮后公布。", "info")
             else:
                 self.say(msg)
             return True
-        self.emit("   没有可用的备用模型了。", "warn")
+        if not self.anonymous:
+            self.emit("   没有可用的备用模型了。", "warn")
         return False
 
     @staticmethod
@@ -229,8 +291,17 @@ class Game:
 
     def thinking(self, p):
         # 夜里不显示谁在思考：否则大家就知道谁是狼人/预言家/女巫了
-        if not self.is_human(p) and not self.night_now:
+        if self.night_now:
+            return
+        # 匿名模式下真人和 AI 显示一样的"思考中"，大家分不出谁是真人
+        if self.anonymous or not self.is_human(p):
             self.emit(f"   …{self.label(p)} 思考中", "thinking")
+
+    def by_seat(self, s):
+        return next(p for p in self.players if p["seat"] == s)
+
+    def role_of(self, role):
+        return next((p for p in self.alive() if p["role"] == role), None)
 
     def night(self):
         self.day += 1
@@ -239,12 +310,21 @@ class Game:
         self.emit("   🌙 夜间行动中…（不显示是谁，以免暴露身份）", "thinking")
         alive = self.alive()
 
-        # 1) 狼人：按座位依次提议，后面的狼看得到前面的提议，最后一只狼拍板（你是狼的话你最后决定）
+        # 0) 守卫：守护一人，不能连续两晚守同一人
+        guarded = 0
+        guard = self.role_of("守卫")
+        if guard:
+            opts = [p for p in alive if p["seat"] != self.last_guard]
+            _, guarded = self.ask(guard, "你是守卫。选择今晚要守护的人（可以守自己；不能和上一晚相同；0=不守）。",
+                                  opts, allow_none=True)
+            self.last_guard = guarded
+            self.tell(guard, f"第{self.day}夜：你守护了 {guarded}号" if guarded else f"第{self.day}夜：你没有守护任何人")
+
+        # 1) 狼人：按座位依次提议，后面的狼看得到前面的提议，最后一只狼拍板（真人狼排在最后）
         wolves = [p for p in alive if p["role"] == "狼人"]
         wolves.sort(key=lambda p: self.is_human(p))
         kill = 0
         for w in wolves:
-            self.thinking(w)
             _, kill = self.ask(w, "你是狼人。选择今晚要杀的人（可以和队友商量的结果一致）。", alive)
             for mate in wolves:
                 if mate is not w:
@@ -254,61 +334,91 @@ class Game:
             self.tell(w, f"第{self.day}夜：狼队最终决定杀 {self.label(victim)}")
 
         # 2) 女巫
-        dead = [victim]
-        witch = next((p for p in alive if p["role"] == "女巫"), None)
+        saved, poisoned = False, None
+        witch = self.role_of("女巫")
         if witch:
-            saved = False
             if self.antidote:
                 self.tell(witch, f"第{self.day}夜：今晚被狼人杀的是 {self.label(victim)}")
-                self.thinking(witch)
                 # 救就填被杀者的座位号，不救填 0（以前用 1=救 容易被 AI 误解成座位号）
                 _, s = self.ask(witch, f"你是女巫。要用解药救 {self.label(victim)} 吗？救就填 {victim['seat']}，不救填 0。",
                                 [victim], allow_none=True)
                 if s == victim["seat"]:
                     self.antidote, saved = False, True
-                    dead = []
                     self.tell(witch, f"第{self.day}夜：你用解药救了 {self.label(victim)}")
             if self.poison and not saved:
-                self.thinking(witch)
                 _, t = self.ask(witch, "你是女巫。要用毒药毒谁？不用就填 0。",
                                 [p for p in alive if p is not witch], allow_none=True)
                 if t:
                     self.poison = False
-                    dead.append(self.by_seat(t))
+                    poisoned = self.by_seat(t)
                     self.tell(witch, f"第{self.day}夜：你毒了 {t}号")
 
         # 3) 预言家
-        seer = next((p for p in alive if p["role"] == "预言家"), None)
+        seer = self.role_of("预言家")
         if seer:
-            self.thinking(seer)
             _, t = self.ask(seer, "你是预言家。选择今晚要查验的人。", [p for p in alive if p is not seer])
             q = self.by_seat(t)
             self.tell(seer, f"第{self.day}夜查验：{self.label(q)} 是{'狼人' if q['role'] == '狼人' else '好人'}")
 
-        # 天亮公布
-        dead = list({p["seat"]: p for p in dead}.values())
-        for p in dead:
+        # 结算：被守护或被救（只有其一）就活下来；同守同救仍然死亡；毒药挡不住
+        dead = {}   # 座位号 → (玩家, 死因)
+        if saved == (guarded == victim["seat"]):      # 既没守也没救，或者同守同救 → 死
+            dead[victim["seat"]] = (victim, "kill")
+        if poisoned:                                   # 被毒的一定死；又被杀又被毒按"毒死"算（猎人不能开枪）
+            dead[poisoned["seat"]] = (poisoned, "poison")
+        dead = list(dead.values())
+        for p, _ in dead:
             p["alive"] = False
+
         self.night_now = False
         self.say(f"\n☀️  ===== 第 {self.day} 天 =====  天亮了")
         for msg in self.deferred:
             self.say(msg)
         self.deferred = []
-        self.say("昨晚死亡：" + ("、".join(self.label(p) for p in dead) if dead else "平安夜，没有人死亡"))
+        self.say("昨晚死亡：" + ("、".join(self.label(p) for p, _ in dead) if dead else "平安夜，没有人死亡"))
         return dead
-
-    def by_seat(self, s):
-        return next(p for p in self.players if p["seat"] == s)
 
     def last_words(self, p):
         self.thinking(p)
         text, _ = self.ask(p, "你出局了，请说遗言。", speech=True)
         self.say(f"💬 {self.label(p)}（遗言）：{text}")
 
+    def hunter_shot(self, p, cause):
+        """猎人出局时开枪（被毒死不能开枪）"""
+        if p["role"] != "猎人" or cause == "poison":
+            return
+        self.thinking(p)
+        _, t = self.ask(p, "你是猎人，你出局了。可以开枪带走一人（0=不开枪）。",
+                        [a for a in self.alive() if a is not p], allow_none=True)
+        if t:
+            target = self.by_seat(t)
+            target["alive"] = False
+            self.say(f"💥 {self.label(p)} 是猎人，开枪带走了 {self.label(target)}")
+
+    def vote(self, alive):
+        """投票：大家都看不到别人的票，最后一起公布"""
+        def one(p):
+            return p["seat"], self.ask(p, "投票放逐一人（看不到别人的票）。0=弃票。",
+                                       [a for a in alive if a is not p], allow_none=True)[1]
+        if self.parallel_votes:
+            self.emit("   🗳 投票中…（所有人同时投票）", "thinking")
+            with ThreadPoolExecutor(len(alive)) as ex:
+                return dict(ex.map(one, alive))
+        votes = {}
+        for p in alive:
+            self.thinking(p)
+            s, t = one(p)
+            votes[s] = t
+        return votes
+
     def day_phase(self, night_dead):
         if self.day == 1:
-            for p in night_dead:
+            for p, _ in night_dead:
                 self.last_words(p)
+        for p, cause in night_dead:
+            self.hunter_shot(p, cause)
+        if self.winner():
+            return
         # 发言：从随机的存活玩家开始，按座位顺序
         alive = self.alive()
         k = random.randrange(len(alive))
@@ -316,14 +426,8 @@ class Game:
             self.thinking(p)
             text, _ = self.ask(p, "白天发言阶段，请发言。", speech=True)
             self.say(f"💬 {self.label(p)}：{text}")
-        # 投票：大家都看不到别人的票，最后一起公布
-        votes = {}
-        for p in alive:
-            self.thinking(p)
-            _, t = self.ask(p, "投票放逐一人（看不到别人的票）。0=弃票。",
-                            [a for a in alive if a is not p], allow_none=True)
-            votes[p["seat"]] = t
-        self.say("🗳  投票：" + "  ".join(f"{s}→{t or '弃'}" for s, t in votes.items()))
+        votes = self.vote(alive)
+        self.say("🗳  投票：" + "  ".join(f"{s}→{t or '弃'}" for s, t in sorted(votes.items())))
         count = {}
         for t in votes.values():
             if t:
@@ -334,20 +438,21 @@ class Game:
         top = max(count.values())
         leaders = [s for s, c in count.items() if c == top]
         if len(leaders) > 1:
-            self.say(f"平票（{'、'.join(map(str, leaders))}号），无人出局。")
+            self.say(f"平票（{'、'.join(map(str, sorted(leaders)))}号），无人出局。")
             return
         out = self.by_seat(leaders[0])
         out["alive"] = False
         self.say(f"被放逐：{self.label(out)}")
         self.last_words(out)
+        self.hunter_shot(out, "vote")
 
     def run(self):
-        self.emit("🐺 狼人杀开始！座位：\n" + "\n".join(f"   {self.label(p)}" for p in self.players), "public")
-        self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
-        self.log("身份（秘密）：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players))
-        me = self.human()
-        if me:
-            self.tell(me, f"你的身份是：{me['role']}")
+        self.emit(f"🐺 {self.n} 人狼人杀开始！座位：\n" + "\n".join(f"   {self.label(p)}" for p in self.players), "public")
+        with self.lock:
+            self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
+        self.log("身份（秘密）：" + "、".join(f"{self.real_label(p)}={p['role']}" for p in self.players))
+        for h in self.humans():
+            self.tell(h, f"你是 {h['seat']}号，身份：{h['role']}")
         for w in (p for p in self.players if p["role"] == "狼人"):
             mates = [self.label(m) for m in self.players if m["role"] == "狼人" and m is not w]
             self.tell(w, f"你的狼队友是：{'、'.join(mates)}")
@@ -364,8 +469,8 @@ class Game:
             self.say("\n游戏已退出。")
         except (KeyboardInterrupt, EOFError):
             self.say("\n游戏被中断。")
-        self.emit("身份揭晓：" + "、".join(f"{self.label(p)}={p['role']}" for p in self.players), "reveal")
-        self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "info")
+        self.emit("身份揭晓：\n" + "\n".join(f"   {self.real_label(p)}：{p['role']}" for p in self.players), "reveal")
+        self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "logpath")
 
 
 # 开局时的终端设置（防止 AI 工具把终端改成"按回车没反应"的状态）
@@ -431,7 +536,7 @@ def find_models(names):
     return chosen
 
 
-def pick_players(wanted, need, fake, out=print):
+def pick_players(wanted, need, fake, out=print, allow_repeat=False):
     """先用你指定的，再随机补齐；每个都先测一下能不能用，不能用的提示并跳过"""
     workdir = tempfile.mkdtemp(prefix="werewolf-check-")
     queue = wanted[:]                                   # 指定的排在前面
@@ -453,9 +558,16 @@ def pick_players(wanted, need, fake, out=print):
             else:
                 first = next((l for l in err.splitlines() if "ERROR" in l or "error" in l), err)
                 out(f"⚠️  {m['name']} 不可用，本局不参加：{first[-200:]}")
+    if len(ok_list) < need and allow_repeat and ok_list:
+        # 可用模型不够坐满：同一个模型可以坐多个座位（各自独立思考，匿名模式下看不出来）
+        base = ok_list[:]
+        while len(ok_list) < need:
+            ok_list.append(dict(random.choice(base)))
+        out(f"可用模型不够 {need} 个，部分模型会占用多个座位。")
     if len(ok_list) < need:
         raise NotEnoughModels(f"可用模型只有 {len(ok_list)} 个，不够 {need} 个，游戏无法开始。")
-    return ok_list, queue                               # queue 里剩下的是没测过的备用模型
+    spare = queue + ([dict(m) for m in ok_list] if allow_repeat else [])
+    return ok_list, spare                               # 备用模型：没测过的 +（允许重复时）已确认可用的
 
 
 if __name__ == "__main__":
@@ -464,19 +576,20 @@ if __name__ == "__main__":
     ap.add_argument("--list", action="store_true", help="列出模型池")
     ap.add_argument("--fake", action="store_true", help="AI 随机行动（不花额度，测试用）")
     ap.add_argument("--auto", action="store_true", help="你的座位也由 AI 代打（测试用）")
+    ap.add_argument("--size", type=int, default=6, choices=sorted(ROLESETS), help="总人数（默认 6）")
     a = ap.parse_args()
     if a.list:
         for m in MODEL_POOL:
             print(f"  {m['name']:<16} ({m['kind']}: {m['model']})")
         sys.exit()
-    need = 6 if a.auto else 5
+    need = a.size if a.auto else a.size - 1
     wanted = find_models([n.strip() for n in a.players.split(",") if n.strip()])
     if len(wanted) > need:
         sys.exit(f"最多指定 {need} 个模型。")
     while True:
         # 每局都重新抽取、重新检查模型（额度可能刚恢复或刚用完）
         try:
-            chosen, spare = pick_players(wanted, need, a.fake)
+            chosen, spare = pick_players(wanted, need, a.fake, allow_repeat=a.size > 6)
         except NotEnoughModels as e:
             sys.exit(str(e))
         entries = chosen if a.auto else chosen + [HUMAN]

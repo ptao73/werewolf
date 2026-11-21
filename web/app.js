@@ -1,9 +1,9 @@
-// 狼人杀网页版前端：每 1.5 秒问一次服务器"有什么新消息、是否轮到我"
-// 所有文字都用 textContent 显示（不当作 HTML），防止 AI 的发言里混进网页代码
+// 狼人杀网页版（多人）前端：每 1.5 秒问一次服务器"有什么新消息、是否轮到我"
+// 所有文字都用 textContent 显示（不当作 HTML），防止发言里混进网页代码
 const log = document.getElementById("log");
 const panel = document.getElementById("panel");
 const statusEl = document.getElementById("status");
-let game = -1, shown = 0, panelKey = "", pool = [];
+let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0;
 
 function el(tag, attrs = {}, text) {
   const e = document.createElement(tag);
@@ -25,6 +25,17 @@ async function post(path, body) {
   return j;
 }
 
+// 点按钮 → 发请求；失败时把原因显示在 errEl
+function action(button, errEl, fn) {
+  button.onclick = async () => {
+    button.disabled = true;
+    errEl.textContent = "";
+    try { await fn(); panelKey = ""; await tick(); }
+    catch (e) { errEl.textContent = e.message; button.disabled = false; }
+  };
+  return button;
+}
+
 function addEvent(ev) {
   let cls = ev.kind;
   if (ev.text.includes("===== 第") && ev.text.includes("夜")) cls += " night";
@@ -32,96 +43,108 @@ function addEvent(ev) {
   log.appendChild(el("div", { class: "ev " + cls }, ev.text.replace(/^\n+/, "")));
 }
 
-function errLine() { return el("div", { class: "err" }); }
+const errLine = () => el("div", { class: "err" });
+const row = (...kids) => { const d = el("div", { class: "btns" }); d.append(...kids); return d; };
 
-// 提交回答：按钮先变灰，失败时显示原因
-async function send(body, errEl, buttons) {
-  buttons.forEach(b => (b.disabled = true));
-  try {
-    await post("/api/answer", body);
-    panelKey = ""; // 让面板马上刷新
-    await tick();
-  } catch (e) {
-    errEl.textContent = "提交失败：" + e.message;
-    buttons.forEach(b => (b.disabled = false));
-  }
+function nickInput() {
+  const i = el("input", { type: "text", maxlength: "12", placeholder: "你的昵称" });
+  i.value = localStorage.getItem("nick") || "";
+  i.oninput = () => localStorage.setItem("nick", i.value);
+  return i;
 }
 
+function sizeSelect(sizes, current) {
+  const s = el("select");
+  for (const n of sizes) {
+    const o = el("option", { value: String(n) }, n + " 人局");
+    if (n === current) o.selected = true;
+    s.appendChild(o);
+  }
+  return s;
+}
+
+// ---------- 轮到你 ----------
 function renderTurn(p) {
   panel.appendChild(el("div", { class: "task" }, "👉 " + p.task));
+  countdownEl = el("div", { class: "countdown" });
+  deadline = Date.now() + p.seconds_left * 1000;
+  panel.appendChild(countdownEl);
   const err = errLine();
   let ta = null;
   if (p.speech) {
     ta = el("textarea", { placeholder: "输入你的发言（留空 = 过）", maxlength: "300" });
     panel.appendChild(ta);
   }
-  const box = el("div", { class: "btns" });
   const buttons = [];
   const text = () => (ta ? ta.value : "");
+  const send = async (seat) => {
+    buttons.forEach(b => (b.disabled = true));
+    try { await post("/api/answer", { id: p.id, text: text(), seat }); panelKey = ""; await tick(); }
+    catch (e) { err.textContent = "提交失败：" + e.message; buttons.forEach(b => (b.disabled = false)); }
+  };
+  const box = el("div", { class: "btns" });
   if (p.choices.length) {
-    for (const c of p.choices) {
-      const b = el("button", { onclick: () => send({ id: p.id, text: text(), seat: c.seat }, err, buttons) }, c.label);
-      buttons.push(b); box.appendChild(b);
-    }
-    if (p.allow_none) {
-      const b = el("button", { onclick: () => send({ id: p.id, text: text(), seat: 0 }, err, buttons) }, "不选 / 弃票");
-      buttons.push(b); box.appendChild(b);
-    }
+    for (const c of p.choices) buttons.push(el("button", { onclick: () => send(c.seat) }, c.label));
+    if (p.allow_none) buttons.push(el("button", { onclick: () => send(0) }, "不选 / 弃票"));
   } else {
-    const b = el("button", { class: "primary", onclick: () => send({ id: p.id, text: text(), seat: 0 }, err, buttons) }, "发言");
-    const b2 = el("button", { onclick: () => { if (ta) ta.value = ""; send({ id: p.id, text: "", seat: 0 }, err, buttons); } }, "过");
-    buttons.push(b, b2); box.append(b, b2);
+    buttons.push(el("button", { class: "primary", onclick: () => send(0) }, "发言"));
+    buttons.push(el("button", { onclick: () => { if (ta) ta.value = ""; send(0); } }, "过"));
   }
+  box.append(...buttons);
   panel.append(box, err);
   if (ta) ta.focus();
 }
 
-function renderFailure(p) {
-  panel.appendChild(el("div", { class: "task" }, "⚠️ 有 AI 调用失败，怎么办？"));
-  const err = errLine(), box = el("div", { class: "btns" }), buttons = [];
-  for (const [c, label] of [["r", "重试"], ["s", "换一个模型接替"], ["q", "退出本局"]]) {
-    const b = el("button", { class: c === "q" ? "danger" : "", onclick: () => send({ id: p.id, choice: c }, err, buttons) }, label);
-    buttons.push(b); box.appendChild(b);
+// ---------- 大厅 ----------
+function renderIdle(s) {
+  panel.appendChild(el("div", { class: "task" }, "还没有房间，创建一个吧"));
+  const nick = nickInput(), size = sizeSelect(s.room.sizes, 6), err = errLine();
+  const btn = action(el("button", { class: "primary" }, "创建房间"), err,
+    () => post("/api/room/create", { nick: nick.value, size: Number(size.value) }));
+  panel.append(row(nick, size, btn), err);
+}
+
+function renderLobby(s) {
+  const r = s.room, me = s.me, err = errLine();
+  panel.appendChild(el("div", { class: "task" },
+    `房间：${r.size} 人局 · 房主 ${r.host} · 已加入 ${r.members.length} 人，开始后由 ${r.ai} 个 AI 补位`));
+  panel.appendChild(el("div", { class: "members" }, "👥 " + r.members.join("、")));
+  if (!me.member) {
+    const nick = nickInput();
+    panel.append(row(nick, action(el("button", { class: "primary" }, "加入"), err,
+      () => post("/api/room/join", { nick: nick.value }))), err);
+    return;
   }
-  panel.append(box, err);
+  if (me.host) {
+    const size = sizeSelect(r.sizes, r.size);
+    size.onchange = async () => {
+      try { await post("/api/room/size", { size: Number(size.value) }); panelKey = ""; await tick(); }
+      catch (e) { err.textContent = e.message; size.value = String(r.size); }
+    };
+    const start = action(el("button", { class: "primary" }, game > 0 ? "🔁 开始下一局" : "开始游戏"), err,
+      () => post("/api/room/start"));
+    const leave = action(el("button", { class: "danger" }, "解散房间"), err, () => post("/api/room/leave"));
+    panel.append(row(size, start, leave), err);
+  } else {
+    panel.appendChild(el("div", { class: "info" }, "等待房主开始…"));
+    panel.append(row(action(el("button", { class: "danger" }, "离开房间"), err, () => post("/api/room/leave"))), err);
+  }
 }
 
-function renderIdle(hasPlayed) {
-  const err = errLine();
-  const start = el("button", { class: "primary" }, hasPlayed ? "🔁 下一局" : "开始游戏");
-  // 可选：指定参加的模型（不选 = 全部随机）
-  const det = el("details");
-  det.appendChild(el("summary", {}, "指定模型（可选，最多 5 个，不够的随机补齐）"));
-  const box = el("div", { class: "pool" });
-  const checks = pool.map(name => {
-    const cb = el("input", { type: "checkbox", value: name });
-    const lab = el("label"); lab.append(cb, " " + name); box.appendChild(lab);
-    return cb;
-  });
-  det.appendChild(box);
-  start.onclick = async () => {
-    const players = checks.filter(c => c.checked).map(c => c.value);
-    if (players.length > 5) { err.textContent = "最多选 5 个"; return; }
-    start.disabled = true;
-    try { await post("/api/new", { players }); panelKey = ""; await tick(); }
-    catch (e) { err.textContent = "开始失败：" + e.message; start.disabled = false; }
-  };
-  panel.append(el("div", { class: "btns" }), det, err);
-  panel.firstChild.appendChild(start);
-}
-
-function renderWaiting() {
+function renderWaiting(s) {
   panel.appendChild(el("div", { class: "task" }, "⏳ 等待其他玩家…"));
-  const err = errLine();
-  const stop = el("button", { class: "danger" }, "结束本局");
-  stop.onclick = async () => {
-    if (!confirm("确定要结束这一局吗？")) return;
-    try { await post("/api/stop"); } catch (e) { err.textContent = e.message; }
-  };
-  const box = el("div", { class: "btns" }); box.appendChild(stop);
-  panel.append(box, err);
+  if (s.me.host) {
+    const err = errLine();
+    const stop = el("button", { class: "danger" }, "结束本局");
+    stop.onclick = async () => {
+      if (!confirm("确定要结束这一局吗？")) return;
+      try { await post("/api/stop"); } catch (e) { err.textContent = e.message; }
+    };
+    panel.append(row(stop), err);
+  }
 }
 
+// ---------- 主循环 ----------
 async function tick() {
   let s;
   try {
@@ -135,28 +158,38 @@ async function tick() {
   if (s.game !== game) {                 // 新的一局（或刚打开页面）：清空后从头显示
     const firstLoad = game === -1;
     game = s.game; log.textContent = ""; shown = 0; panelKey = "";
-    if (!firstLoad) return tick();       // 换局了：重新从第 0 条拉取
+    if (!firstLoad) return tick();
   }
   const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
-  for (const ev of s.events) if (ev.i === shown) { addEvent(ev); shown++; }
+  for (const ev of s.events) { addEvent(ev); shown = ev.i + 1; }
+  if (s.events.length === 0 && s.total > shown && !s.me.in_game) shown = s.total;  // 看不到的消息直接跳过
   if (atBottom && s.events.length) window.scrollTo(0, document.body.scrollHeight);
-  statusEl.textContent = s.running ? (s.pending ? "轮到你了" : "进行中") : "未开始";
+
+  const st = s.room.state;
+  statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
-  const key = JSON.stringify([s.running, s.pending && s.pending.id, game]);
+  const key = JSON.stringify([st, s.room.members, s.room.size, s.me, s.pending && s.pending.id, game]);
   if (key !== panelKey) {
     panelKey = key;
     panel.textContent = "";
-    if (s.pending && s.pending.type === "turn") renderTurn(s.pending);
-    else if (s.pending && s.pending.type === "failure") renderFailure(s.pending);
-    else if (s.running) renderWaiting();
-    else renderIdle(game > 0);
+    countdownEl = null;
+    if (s.pending) renderTurn(s.pending);
+    else if (st === "idle") renderIdle(s);
+    else if (st === "lobby") renderLobby(s);
+    else if (s.me.in_game) renderWaiting(s);
+    else panel.appendChild(el("div", { class: "task" }, "游戏进行中，你没有参加这一局，请等待下一局。"));
     if (s.pending) window.scrollTo(0, document.body.scrollHeight);
   }
 }
 
-(async () => {
-  try { pool = await (await fetch("/api/pool")).json(); } catch (e) { pool = []; }
-  await tick();
-  setInterval(tick, 1500);
-})();
+// 倒计时每秒更新一次（不重画面板）
+setInterval(() => {
+  if (countdownEl) {
+    const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+    countdownEl.textContent = `⏱ 剩余 ${left} 秒` + (left === 0 ? "（已超时，系统自动处理）" : "");
+  }
+}, 1000);
+
+tick();
+setInterval(tick, 1500);

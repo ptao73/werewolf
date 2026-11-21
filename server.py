@@ -6,7 +6,7 @@
 - 从隧道进来的请求必须带有效的 Cloudflare Access 登录凭证（JWT），否则一律 403
 - 同一时间只跑一局（只有你一个真人玩家）
 """
-import base64, json, sys, threading, time, traceback
+import base64, json, random, sys, threading, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -79,125 +79,230 @@ ACCESS = AccessCheck(ACCESS_TEAM)
 
 
 # ---------- 游戏控制：网页和游戏线程之间传话 ----------
+TURN_SECONDS = 120     # 真人每次行动的时间限制
+SIZES = sorted(w.ROLESETS)
+
+
 class WebGame(w.Game):
-    """和终端版规则完全一样，只是把"打印"和"输入"换成网页"""
+    """规则和终端版完全一样；多人网页版：匿名、同时投票、AI 出错自动处理"""
+    anonymous = True
+    parallel_votes = True
+    auto_recover = True
 
     def __init__(self, ctl, *args, **kw):
         self.ctl = ctl
+        self.quit_raised = False
         super().__init__(*args, **kw)
 
-    def emit(self, text, kind="info"):
-        self.ctl.add(text, kind)
-        # 你点了"结束本局"：下一次有输出时就停下（不用等到轮到你）
-        if self.ctl.take_stop():
-            raise w.Quit()
+    def check_stop(self):
+        """房主点了"结束本局"：抛出一次 Quit（只抛一次，避免退出过程中再次触发）"""
+        with self.ctl.cond:
+            if self.ctl.stop_flag and not self.quit_raised:
+                self.quit_raised = True
+                raise w.Quit()
+
+    def emit(self, text, kind="info", to=None):
+        if kind == "logpath":          # 日志路径只给管理员看，不发到网页
+            return
+        self.ctl.add(text, kind, to["uid"] if to else None)
+        self.check_stop()
 
     def call_ai(self, p, prompt):
-        # 每次调用 AI 之前也检查"结束本局"，夜里没有输出时也能尽快停下
-        if self.ctl.take_stop():
-            raise w.Quit()
+        self.check_stop()              # 夜里没有输出时也能尽快停下
         return super().call_ai(p, prompt)
 
-    def ask_human(self, task, choices, allow_none, speech):
+    def ask_human(self, p, task, choices, allow_none, speech):
+        self.check_stop()
         spec = {"type": "turn", "task": task, "speech": speech, "allow_none": allow_none,
                 "choices": [{"seat": c["seat"], "label": self.label(c)} for c in (choices or [])]}
-        ans = self.ctl.wait_answer(spec)
+        ans = self.ctl.wait_answer(p["uid"], spec, TURN_SECONDS)
+        if ans == "STOP":
+            self.check_stop()
+            ans = None                 # 退出信号已由别的线程抛出：这里随便给个默认值让线程结束
+        if ans is None:                # 超时：自动处理，只私下告诉本人
+            valid = [c["seat"] for c in (choices or [])]
+            seat = 0 if (allow_none or not valid) else random.choice(valid)
+            if not self.quit_raised:
+                what = "发言记为“过”" if speech else ("不选/弃票" if seat == 0 else f"随机选了 {seat}号")
+                self.emit(f"⏰ 你超时了，系统已自动{what}。", "private", to=p)
+            return ("过。" if speech else ""), seat
         text = w.clean_input(str(ans.get("text", ""))).strip()[:300]
         if speech and not text:
             text = "过。"
         return text, int(ans.get("seat") or 0)
 
-    def ask_failure(self):
-        return self.ctl.wait_answer({"type": "failure"})["choice"]
-
 
 class Controller:
+    """一个房间：大厅（等人）→ 游戏中 → 回到大厅"""
+
     def __init__(self):
         self.cond = threading.Condition()
+        self.state = "idle"            # idle 没房间 / lobby 等人 / running 游戏中
+        self.host, self.size = None, 6
+        self.members = {}              # uid → 昵称（按加入顺序）
+        self.players = set()           # 本局参加的 uid（游戏中才有）
         self.events, self.game_no = [], 0
-        self.pending, self.pending_id, self.answer = None, 0, None
-        self.running, self.stop_flag = False, False
+        self.pending = {}              # uid → 待回答的问题
+        self.answers = {}              # uid → 回答
+        self.next_id = 0
+        self.stop_flag = False
 
-    def add(self, text, kind):
+    # ----- 游戏线程用 -----
+    def add(self, text, kind, to=None):
         with self.cond:
-            self.events.append({"i": len(self.events), "kind": kind, "text": text})
+            self.events.append({"i": len(self.events), "kind": kind, "text": text, "to": to})
             self.cond.notify_all()
 
-    def wait_answer(self, spec):
-        """游戏线程在这里等你在网页上回答"""
+    def wait_answer(self, uid, spec, timeout):
+        """等某位玩家回答。返回回答；超时返回 None；本局被结束返回 "STOP" """
         with self.cond:
-            self.pending_id += 1
-            self.pending = dict(spec, id=self.pending_id)
-            self.answer = None
-            while self.answer is None:
-                if self.stop_flag:
-                    self.stop_flag, self.pending = False, None   # 退出信号只用一次
-                    raise w.Quit()
-                self.cond.wait(1)
-            ans, self.answer, self.pending = self.answer, None, None
-            return ans
+            self.next_id += 1
+            self.pending[uid] = dict(spec, id=self.next_id, deadline=time.time() + timeout)
+            self.answers.pop(uid, None)
+            end = time.time() + timeout
+            try:
+                while uid not in self.answers:
+                    if self.stop_flag:
+                        return "STOP"
+                    left = end - time.time()
+                    if left <= 0:
+                        return None
+                    self.cond.wait(min(left, 1))
+                return self.answers.pop(uid)
+            finally:
+                self.pending.pop(uid, None)
 
-    def give_answer(self, data):
-        """网页提交回答；先检查是否合法"""
+    # ----- 网页请求用（都要先拿到锁）-----
+    def give_answer(self, uid, data):
         with self.cond:
-            p = self.pending
+            p = self.pending.get(uid)
             if not p or data.get("id") != p["id"]:
                 return "这个问题已经过期，请刷新页面"
-            if p["type"] == "failure":
-                if data.get("choice") not in ("r", "s", "q"):
-                    return "无效选项"
-            else:
-                seat = data.get("seat") or 0
-                valid = [c["seat"] for c in p["choices"]] + ([0] if p["allow_none"] or not p["choices"] else [])
-                if not isinstance(seat, int) or seat not in valid:
-                    return "无效座位号"
-            self.answer = data
+            seat = data.get("seat") or 0
+            valid = [c["seat"] for c in p["choices"]] + ([0] if p["allow_none"] or not p["choices"] else [])
+            if not isinstance(seat, int) or seat not in valid:
+                return "无效座位号"
+            self.answers[uid] = data
             self.cond.notify_all()
             return None
 
-    def start(self, wanted_names):
+    @staticmethod
+    def clean_nick(nick):
+        nick = w.clean_input(str(nick or "")).strip()
+        return nick[:12]
+
+    def create(self, uid, nick, size):
+        nick = self.clean_nick(nick)
         with self.cond:
-            if self.running:
-                return "已经有一局在进行"
-            try:
-                wanted = w.find_models(wanted_names) if wanted_names else []
-            except SystemExit as e:
-                return str(e)
-            if len(wanted) > 5:
-                return "最多指定 5 个模型"
+            if self.state != "idle":
+                return "已经有房间了，请直接加入"
+            if not nick:
+                return "请输入昵称"
+            if size not in SIZES:
+                return "人数只能是 " + "/".join(map(str, SIZES))
+            self.state, self.host, self.size = "lobby", uid, size
+            self.members = {uid: nick}
+            self.events, self.players = [], set()
+            return None
+
+    def join(self, uid, nick):
+        nick = self.clean_nick(nick)
+        with self.cond:
+            if self.state != "lobby":
+                return "现在不能加入（没有房间或游戏进行中）"
+            if not nick:
+                return "请输入昵称"
+            if nick in [n for u, n in self.members.items() if u != uid]:
+                return "这个昵称已经有人用了"
+            if uid not in self.members and len(self.members) >= self.size:
+                return "房间已满"
+            self.members[uid] = nick
+            return None
+
+    def leave(self, uid):
+        with self.cond:
+            if self.state != "lobby" or uid not in self.members:
+                return "现在不能离开"
+            del self.members[uid]
+            if uid == self.host:       # 房主走了：房间解散
+                self.state, self.host, self.members = "idle", None, {}
+            return None
+
+    def set_size(self, uid, size):
+        with self.cond:
+            if uid != self.host or self.state != "lobby":
+                return "只有房主可以改人数"
+            if size not in SIZES:
+                return "人数只能是 " + "/".join(map(str, SIZES))
+            if len(self.members) > size:
+                return f"已经有 {len(self.members)} 人加入，不能少于这个数"
+            self.size = size
+            return None
+
+    def start(self, uid):
+        with self.cond:
+            if uid != self.host or self.state != "lobby":
+                return "只有房主可以开始游戏"
+            humans = [{"name": n, "kind": "human", "uid": u} for u, n in self.members.items()]
+            self.state, self.players = "running", set(self.members)
             self.events, self.game_no = [], self.game_no + 1
-            self.running, self.stop_flag, self.pending = True, False, None
-        threading.Thread(target=self.run_game, args=(wanted,), daemon=True).start()
+            self.pending, self.answers, self.stop_flag = {}, {}, False
+            size = self.size
+        threading.Thread(target=self.run_game, args=(humans, size), daemon=True).start()
         return None
 
-    def run_game(self, wanted):
+    def run_game(self, humans, size):
+        need = size - len(humans)
         try:
-            chosen, spare = w.pick_players(wanted, 5, FAKE, out=lambda t: self.add(t, "info"))
-            WebGame(self, chosen + [w.HUMAN], spare, fake=FAKE).run()
+            game_log = []
+            if need:
+                self.add(f"🤖 正在准备 {need} 个 AI 玩家…（约 10 秒）", "info")
+                # 检查过程只写日志：不让大家知道有哪些模型
+                chosen, spare = w.pick_players([], need, FAKE, out=game_log.append, allow_repeat=True)
+            else:
+                chosen, spare = [], []
+            g = WebGame(self, chosen + humans, spare, fake=FAKE)
+            for line in game_log:
+                g.log("[模型检查] " + line)
+            g.run()
         except w.NotEnoughModels as e:
             self.add(f"⚠️ {e}", "warn")
         except Exception:
-            self.add("⚠️ 程序出错：\n" + traceback.format_exc()[-800:], "warn")
+            self.add("⚠️ 程序出错，本局结束。", "warn")
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
         finally:
             with self.cond:
-                self.running, self.pending = False, None
+                self.state = "lobby" if self.host in self.members else "idle"
+                self.pending, self.stop_flag = {}, False
                 self.cond.notify_all()
 
-    def take_stop(self):
-        """取走"结束本局"信号（只取一次，避免退出过程中再次触发）"""
+    def stop(self, uid):
         with self.cond:
-            flag, self.stop_flag = self.stop_flag, False
-            return flag
-
-    def stop(self):
-        with self.cond:
+            if uid != self.host or self.state != "running":
+                return "只有房主可以结束本局"
             self.stop_flag = True
             self.cond.notify_all()
+            return None
 
-    def state(self, since):
+    def view(self, uid, since):
+        """某位玩家能看到的状态：公开消息 + 只发给他的消息"""
         with self.cond:
-            return {"game": self.game_no, "running": self.running, "pending": self.pending,
-                    "events": self.events[since:], "total": len(self.events)}
+            member = uid in self.members
+            in_game = uid in self.players
+            show = in_game or (self.state != "running" and member)
+            evs = [{"i": e["i"], "kind": e["kind"], "text": e["text"]}
+                   for e in self.events[since:] if show and (e["to"] is None or e["to"] == uid)]
+            p = self.pending.get(uid)
+            if p:
+                p = dict(p, seconds_left=max(0, int(p["deadline"] - time.time())))
+                p.pop("deadline", None)
+            return {
+                "me": {"nick": self.members.get(uid), "member": member, "host": uid == self.host, "in_game": in_game},
+                "room": {"state": self.state, "size": self.size, "sizes": SIZES,
+                         "host": self.members.get(self.host), "members": list(self.members.values()),
+                         "ai": max(0, self.size - len(self.members))},
+                "game": self.game_no, "pending": p, "events": evs, "total": len(self.events),
+            }
 
 
 CTL = Controller()
@@ -208,15 +313,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 不往终端刷访问日志
         pass
 
-    def check_access(self):
-        """从隧道来的请求必须带有效的 Access 凭证；本机测试（localhost）放行"""
+    def identify(self):
+        """返回玩家身份（登录邮箱）；不合格就回 403 并返回 None"""
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         if host in ("127.0.0.1", "localhost") and self.client_address[0] == "127.0.0.1" \
                 and not self.headers.get("Cf-Connecting-Ip"):
-            return True
+            return "local:" + (self.headers.get("X-Test-User") or "me")   # 本机测试用
         if host != PUBLIC_HOST:
             self.reply(403, {"error": "forbidden"})
-            return False
+            return None
         token = self.headers.get("Cf-Access-Jwt-Assertion", "")
         if not token:
             for part in (self.headers.get("Cookie") or "").split(";"):
@@ -224,11 +329,10 @@ class Handler(BaseHTTPRequestHandler):
                 if k == "CF_Authorization":
                     token = v
         try:
-            ACCESS.verify(token)
-            return True
+            return ACCESS.verify(token).lower()
         except Exception as e:
             self.reply(403, {"error": f"未通过 Cloudflare Access 登录验证：{e}"})
-            return False
+            return None
 
     def reply(self, code, obj=None, body=None, ctype="application/json; charset=utf-8"):
         data = body if body is not None else json.dumps(obj, ensure_ascii=False).encode()
@@ -242,7 +346,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if not self.check_access():
+        uid = self.identify()
+        if not uid:
             return
         u = urlsplit(self.path)
         if u.path == "/":
@@ -251,14 +356,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, body=(HERE / "web" / "app.js").read_bytes(), ctype="text/javascript; charset=utf-8")
         if u.path == "/api/state":
             q = parse_qs(u.query)
-            since = int(q.get("since", ["0"])[0] or 0)
-            return self.reply(200, CTL.state(max(0, since)))
-        if u.path == "/api/pool":
-            return self.reply(200, [m["name"] for m in w.MODEL_POOL])
+            try:
+                since = max(0, int(q.get("since", ["0"])[0] or 0))
+            except ValueError:
+                since = 0
+            return self.reply(200, CTL.view(uid, since))
         self.reply(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self.check_access():
+        uid = self.identify()
+        if not uid:
             return
         # 防止别的网站借你的登录状态偷偷发请求：必须带这个自定义头（跨站请求带不上）
         if self.headers.get("X-Werewolf") != "1":
@@ -266,23 +373,32 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             data = json.loads(self.rfile.read(min(n, 10000)) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError
         except Exception:
             return self.reply(400, {"error": "bad json"})
-        path = urlsplit(self.path).path
-        if path == "/api/new":
-            names = [str(x) for x in data.get("players", [])][:5]
-            err = CTL.start(names)
-        elif path == "/api/answer":
-            err = CTL.give_answer(data)
-        elif path == "/api/stop":
-            CTL.stop()
-            err = None
-        else:
+        size = data.get("size")
+        actions = {
+            "/api/room/create": lambda: CTL.create(uid, data.get("nick"), size),
+            "/api/room/join": lambda: CTL.join(uid, data.get("nick")),
+            "/api/room/leave": lambda: CTL.leave(uid),
+            "/api/room/size": lambda: CTL.set_size(uid, size),
+            "/api/room/start": lambda: CTL.start(uid),
+            "/api/stop": lambda: CTL.stop(uid),
+            "/api/answer": lambda: CTL.give_answer(uid, data),
+        }
+        act = actions.get(urlsplit(self.path).path)
+        if not act:
             return self.reply(404, {"error": "not found"})
+        err = act()
         self.reply(400 if err else 200, {"error": err} if err else {"ok": True})
 
 
 if __name__ == "__main__":
+    if "--port" in sys.argv:        # 测试用：换端口
+        PORT = int(sys.argv[sys.argv.index("--port") + 1])
+    if "--turn" in sys.argv:        # 测试用：缩短真人时间限制
+        TURN_SECONDS = int(sys.argv[sys.argv.index("--turn") + 1])
     print(f"狼人杀网页版：http://{HOST}:{PORT}  （公网：https://{PUBLIC_HOST}）", flush=True)
     if not ACCESS.audiences():
         print("提示：还没有 access_aud.txt，公网请求会全部被拒绝（403）。", flush=True)
