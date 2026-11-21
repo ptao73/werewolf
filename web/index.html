@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>狼人杀</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161b; --card:#1e2128; --text:#e7e9ee; --dim:#8a90a0; --accent:#e0a93b; --priv:#5fb3ff; --warn:#ff7a6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.55 -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+  header { position:sticky; top:0; z-index:2; background:var(--bg); padding:10px 14px; border-bottom:1px solid #2a2e37; display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:18px; margin:0; flex:1; }
+  #status { color:var(--dim); font-size:13px; }
+  #log { padding:10px 14px 260px; }
+  .ev { white-space:pre-wrap; margin:3px 0; }
+  .public { }
+  .private { color:var(--priv); }
+  .thinking, .info { color:var(--dim); font-size:14px; }
+  .warn { color:var(--warn); }
+  .reveal { color:var(--accent); font-weight:600; }
+  .night { margin-top:14px; color:#a9b4ff; font-weight:600; }
+  .day { margin-top:14px; color:var(--accent); font-weight:600; }
+  #panel { position:fixed; left:0; right:0; bottom:0; background:var(--card); border-top:1px solid #2a2e37; padding:12px 14px calc(12px + env(safe-area-inset-bottom)); max-height:60vh; overflow:auto; }
+  #panel .task { margin-bottom:8px; font-weight:600; }
+  textarea { width:100%; min-height:70px; font:inherit; color:var(--text); background:#111318; border:1px solid #333845; border-radius:8px; padding:8px; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  button { font:inherit; color:var(--text); background:#2c3140; border:1px solid #3a4052; border-radius:8px; padding:9px 13px; }
+  button.primary { background:var(--accent); color:#1a1300; border-color:var(--accent); font-weight:600; }
+  button.danger { background:transparent; color:var(--warn); border-color:#5a2f2b; }
+  button:disabled { opacity:.5; }
+  details { margin-top:8px; color:var(--dim); }
+  .pool { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:6px; }
+  .pool label { white-space:nowrap; }
+  .err { color:var(--warn); margin-top:6px; min-height:1em; font-size:14px; }
+</style>
+</head>
+<body>
+<header><h1>🐺 狼人杀</h1><span id="status">连接中…</span></header>
+<main id="log"></main>
+<section id="panel"></section>
+<script src="/app.js"></script>
+</body>
+</html>

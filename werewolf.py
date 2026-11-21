@@ -155,7 +155,9 @@ class Game:
             self.log(f"[无效回复 {self.label(p)}] {raw[:300]}")
             prompt += "\n（上次回复格式无效，请严格按 JSON 格式重新回复。）"
         # 两次都无效：不偷偷替它选，停下来问你
-        return self.on_failure(p, f"两次回复都无效：{raw[:200]}", lambda: self.ask_ai(p, task, valid, allow_none, speech))
+        # 不显示回复内容：里面可能有身份或夜间行动（如女巫说要救谁），只写进日志，赛后可查
+        return self.on_failure(p, "两次回复格式都无效（内容为保密不显示，已写入日志）",
+                               lambda: self.ask_ai(p, task, valid, allow_none, speech))
 
     def call_ai(self, p, prompt):
         """调用对应的命令行工具，返回它的文字回复；失败就停下来问你"""
