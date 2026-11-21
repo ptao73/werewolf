@@ -216,3 +216,30 @@ setInterval(() => {
 
 tick();
 setInterval(tick, 1500);
+
+// ---------- 排行榜 ----------
+const board = document.getElementById("board");
+document.getElementById("boardBtn").onclick = async () => {
+  board.textContent = "";
+  board.hidden = false;
+  const close = el("button", { class: "primary", onclick: () => (board.hidden = true) }, "关闭");
+  board.appendChild(row(close));
+  let b;
+  try { b = await (await fetch("/api/leaderboard")).json(); }
+  catch (e) { board.appendChild(el("div", { class: "err" }, "读取失败：" + e.message)); return; }
+  board.appendChild(el("h2", {}, `🏆 积分榜（${b.games} 局已完成的真实对局）`));
+  const t = el("table"), head = el("tr");
+  for (const h of ["#", "玩家", "局数", "胜", "胜率", "判断分", "总分", "场均"]) head.appendChild(el("th", {}, h));
+  t.appendChild(head);
+  b.rows.forEach((r, i) => {
+    const tr = el("tr");
+    const cells = [i + 1, (r.human ? "👤 " : "🤖 ") + r.name, r.games, r.wins, r.win_rate + "%", r.judge, r.total, r.avg];
+    for (const c of cells) tr.appendChild(el("td", {}, String(c)));
+    t.appendChild(tr);
+    const d = Object.entries(r.detail).map(([k, v]) => `${k}×${v}`).join("  ");
+    if (d) { const tr2 = el("tr"); const td = el("td", { class: "detail", colspan: "8" }, d); tr2.appendChild(td); t.appendChild(tr2); }
+  });
+  board.appendChild(t);
+  const rules = Object.entries(b.points).map(([k, v]) => `${b.labels[k]} ${v > 0 ? "+" : ""}${v}`).join("，");
+  board.appendChild(el("div", { class: "rules" }, "计分：胜利 +10；" + rules + "。只统计打完的真实对局。"));
+};

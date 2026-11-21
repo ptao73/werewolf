@@ -44,3 +44,13 @@ each player is identified by their Access login e-mail.
 Roles: 6 = 2 wolves, seer, witch, 2 villagers; 8 = 3 wolves, seer, witch, hunter, 2 villagers;
 9 = 3 wolves, seer, witch, hunter, 3 villagers; 12 = 4 wolves, seer, witch, hunter, guard, 4 villagers.
 Terminal: `python3 werewolf.py --size 8`.
+
+## Thinking notebooks & leaderboard
+- Every AI decision carries a private thinking note; the AI sees its own notebook each turn.
+  Notebooks are saved per seat in `logs/<game>/NN号.md` and used in the post-game discussion.
+- `stats.py` scores all finished real games in `logs/` (random-move test games and unfinished games excluded).
+  AIs are ranked by model, humans by login (shown by nickname). `owner_email.txt` (not in git) maps your
+  web login to your terminal games. View: `python3 werewolf.py --stats` or the 🏆 button on the web page.
+- Points: win +10; good-side vote on a wolf +2 / on a good player -1; wolf vote that exiles a good player +1;
+  seer finds a wolf +2; witch poisons a wolf +3 / a good player -3, saves a good player +2;
+  hunter shoots a wolf +3 / a good player -3; guard blocks the kill +3.

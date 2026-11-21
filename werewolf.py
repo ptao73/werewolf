@@ -532,6 +532,11 @@ class Game:
         with self.lock:
             self.public.append("座位：" + "、".join(self.label(p) for p in self.players))
         self.log("身份（秘密）：" + "、".join(f"{self.real_label(p)}={p['role']}" for p in self.players))
+        # 积分统计用：每个座位是谁（AI 的模型 / 真人的登录身份）、是否测试局
+        for p in self.players:
+            self.log(f"[玩家] {p['seat']}|{p['name']}|{p['kind']}|{p.get('model', '')}|{p.get('uid', '')}")
+        if self.fake:
+            self.log("[模式] fake")
         for h in self.humans():
             self.tell(h, f"你是 {h['seat']}号，身份：{h['role']}")
         for w in (p for p in self.players if p["role"] == "狼人"):
@@ -660,8 +665,13 @@ if __name__ == "__main__":
     ap.add_argument("--list", action="store_true", help="列出模型池")
     ap.add_argument("--fake", action="store_true", help="AI 随机行动（不花额度，测试用）")
     ap.add_argument("--auto", action="store_true", help="你的座位也由 AI 代打（测试用）")
+    ap.add_argument("--stats", action="store_true", help="显示积分排行榜")
     ap.add_argument("--size", type=int, default=6, choices=sorted(ROLESETS), help="总人数（默认 6）")
     a = ap.parse_args()
+    if a.stats:
+        import stats
+        stats.print_board()
+        sys.exit()
     if a.list:
         for m in MODEL_POOL:
             print(f"  {m['name']:<16} ({m['kind']}: {m['model']})")

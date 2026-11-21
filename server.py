@@ -403,6 +403,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, body=(HERE / "web" / "index.html").read_bytes(), ctype="text/html; charset=utf-8")
         if u.path == "/app.js":
             return self.reply(200, body=(HERE / "web" / "app.js").read_bytes(), ctype="text/javascript; charset=utf-8")
+        if u.path == "/api/leaderboard":       # 积分榜（真人只显示昵称，不显示邮箱）
+            import stats
+            b = stats.leaderboard()
+            return self.reply(200, {"games": b["games"], "points": stats.POINTS, "labels": stats.LABELS,
+                                    "rows": [{k: r[k] for k in ("name", "human", "games", "wins", "win_rate",
+                                                                "judge", "total", "avg", "detail")} for r in b["rows"]]})
         if u.path == "/api/state":
             q = parse_qs(u.query)
             try:
