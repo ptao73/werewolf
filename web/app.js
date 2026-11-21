@@ -143,7 +143,7 @@ function renderLobby(s) {
       try { await post("/api/room/size", { size: Number(size.value) }); panelKey = ""; await tick(); }
       catch (e) { err.textContent = e.message; size.value = String(r.size); }
     };
-    const start = action(el("button", { class: "primary" }, game > 0 ? "🔁 开始下一局" : "开始游戏"), err,
+    const start = action(el("button", { class: "primary" }, s.discuss.available ? "🔁 开始下一局" : "开始游戏"), err,
       () => post("/api/room/start"));
     const leave = action(el("button", { class: "danger" }, "解散房间"), err, () => post("/api/room/leave"));
     panel.append(row(size, start, leave), err);
@@ -167,7 +167,20 @@ function renderWaiting(s) {
 }
 
 // ---------- 主循环 ----------
+// 同一时间只允许一个 tick 在跑：以前两个 tick 同时拿到同一批消息，就会显示两遍
+let ticking = false, tickAgain = false;
+// 自动跟随最新消息：只有你自己往上翻时才停止跟随，翻回底部又恢复
+let follow = true;
+log.addEventListener("scroll", () => { follow = log.scrollTop + log.clientHeight >= log.scrollHeight - 60; });
+const toBottom = () => { if (follow) log.scrollTop = log.scrollHeight; };
 async function tick() {
+  if (ticking) { tickAgain = true; return; }
+  ticking = true;
+  try { await tickOnce(); } finally { ticking = false; }
+  if (tickAgain) { tickAgain = false; await tick(); }
+}
+
+async function tickOnce() {
   let s;
   try {
     const r = await fetch("/api/state?since=" + (game === -1 ? 0 : shown), { headers: { "X-Werewolf": "1" } });
@@ -179,13 +192,15 @@ async function tick() {
   }
   if (s.game !== game) {                 // 新的一局（或刚打开页面）：清空后从头显示
     const firstLoad = game === -1;
-    game = s.game; log.textContent = ""; shown = 0; panelKey = "";
-    if (!firstLoad) return tick();
+    game = s.game; log.textContent = ""; shown = 0; panelKey = ""; follow = true;
+    if (!firstLoad) { tickAgain = true; return; }
   }
-  const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
-  for (const ev of s.events) { addEvent(ev); shown = ev.i + 1; }
+  for (const ev of s.events) {
+    if (ev.i < shown) continue;          // 已经显示过的消息不再重复显示
+    addEvent(ev); shown = ev.i + 1;
+  }
   if (s.events.length === 0 && s.total > shown && !s.me.in_game) shown = s.total;  // 看不到的消息直接跳过
-  if (atBottom && s.events.length) window.scrollTo(0, document.body.scrollHeight);
+  if (s.events.length) toBottom();
 
   const st = s.room.state;
   statusEl.textContent = s.pending ? "轮到你了" : st === "running" ? "游戏中" : st === "lobby" ? "大厅" : "没有房间";
@@ -202,7 +217,8 @@ async function tick() {
     else if (st === "lobby") renderLobby(s);
     else if (s.me.in_game) renderWaiting(s);
     else panel.appendChild(el("div", { class: "task" }, "游戏进行中，你没有参加这一局，请等待下一局。"));
-    if (s.pending) window.scrollTo(0, document.body.scrollHeight);
+    if (s.pending) follow = true;        // 轮到你时总是跳到最新
+    toBottom();                          // 操作区高度变了，消息区也要重新贴底
   }
 }
 
