@@ -67,7 +67,29 @@ function addSeats(ev) {
   log.appendChild(box);
 }
 
+// 身份揭晓：三个性格用不同颜色（理性=蓝、好胜=橙、诚实=绿）
+const TRAIT_CLASS = { "理性": "t-r", "好胜": "t-c", "诚实": "t-h" };
+function addReveal(ev) {
+  const box = el("div", { class: "ev reveal" });
+  box.appendChild(el("div", {}, "身份揭晓："));
+  for (const r of ev.data.rows) {
+    const line = el("div", { class: "rv" });
+    line.append(el("span", {}, r.label + "："), el("span", { class: "role" }, r.role));
+    if (r.persona) {
+      line.append("（");
+      Object.entries(r.persona).forEach(([k, v], i) => {
+        if (i) line.append(" · ");
+        line.appendChild(el("span", { class: TRAIT_CLASS[k] || "" }, `${k} ${v}%`));
+      });
+      line.append("）");
+    }
+    box.appendChild(line);
+  }
+  log.appendChild(box);
+}
+
 function addEvent(ev) {
+  if (ev.kind === "reveal" && ev.data && ev.data.rows) return addReveal(ev);
   if (ev.kind === "seats" && ev.data) {   // 座位改到顶部固定栏；对话里只留"开始"那一行
     if (ev.data.title.includes("开始")) log.appendChild(el("div", { class: "ev public" }, ev.data.title.replace("座位：", "")));
     return;

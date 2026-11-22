@@ -722,7 +722,9 @@ class Game:
             self.say("\n游戏被中断。")
         self.emit("身份揭晓：\n" + "\n".join(
             f"   {self.real_label(p)}：{p['role']}" + (f"（{persona_short(p['persona'])}）" if p.get("persona") else "")
-            for p in self.players), "reveal")
+            for p in self.players), "reveal",
+            data={"rows": [{"label": self.real_label(p), "role": p["role"], "persona": p.get("persona")}
+                           for p in self.players]})          # 网页版用这份数据给三个性格上不同颜色
         self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "logpath")
 
 
