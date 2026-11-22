@@ -75,8 +75,12 @@ TRAITS = [
 ]
 
 
+PERSONA_SHAPE = 0.4   # U 形分布的强度：越小越容易出现极端值（0.4 ≈ 八成落在两端、近一半 ≤10% 或 ≥90%）
+
+
 def random_persona():
-    return {name: random.randint(0, 100) for name, *_ in TRAITS}
+    """每个属性从 U 形分布（Beta 分布）里抽：两头多、中间少，性格更鲜明"""
+    return {name: round(random.betavariate(PERSONA_SHAPE, PERSONA_SHAPE) * 100) for name, *_ in TRAITS}
 
 
 def persona_text(persona):

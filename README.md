@@ -56,6 +56,6 @@ Terminal: `python3 werewolf.py --size 8`.
   hunter shoots a wolf +3 / a good player -3; guard blocks the kill +3.
 
 ## AI personalities
-Each AI that plays gets three random traits per game (0-100%): 理性 (emotional ↔ rational),
+Each AI that plays gets three random traits per game (0-100%, U-shaped: extremes are common): 理性 (emotional ↔ rational),
 好胜 (easy-going ↔ extremely competitive), 诚实 (cunning ↔ honest). They shape how the AI talks and decides.
 Traits are hidden during the game (showing them would reveal which seats are AIs) and revealed with the roles at the end.
