@@ -6,7 +6,7 @@
 看模型池：  python3 werewolf.py --list
 测试：      python3 werewolf.py --fake --auto   （AI 随机行动、你的座位也自动，不花额度）
 """
-import json, random, re, subprocess, sys, tempfile, threading, time, argparse, termios, unicodedata
+import json, os, random, re, subprocess, sys, tempfile, threading, time, argparse, termios, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -219,7 +219,8 @@ class Game:
         valid = [c["seat"] for c in (choices or [])]
         if self.is_human(p):
             return self.ask_human(p, task, choices, allow_none, speech)
-        if self.fake:  # 测试模式：随机行动
+        if self.fake:  # 测试模式：随机行动（可用环境变量 WEREWOLF_FAKE_DELAY 模拟 AI 思考时间）
+            time.sleep(float(os.environ.get("WEREWOLF_FAKE_DELAY", "0")))
             t = random.choice(valid + ([0] if allow_none else [])) if valid else 0
             return (f"（测试发言）我是{p['seat']}号。" if speech else ""), t
         return self.ask_ai(p, task, valid, allow_none, speech)

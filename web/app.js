@@ -18,6 +18,10 @@ window.addEventListener("resize", fitViewport);
 window.addEventListener("orientationchange", fitViewport);
 document.addEventListener("focusout", () => setTimeout(fitViewport, 50));   // 键盘收起
 fitViewport();      // 我的座位和身份（用来在座位表里标蓝）
+// 提前写的发言草稿：只存在你自己的手机里，轮到你发言时自动填进去
+const draftKey = () => "speechDraft:" + game;
+const getDraft = () => localStorage.getItem(draftKey()) || "";
+const setDraft = (t) => t ? localStorage.setItem(draftKey(), t) : localStorage.removeItem(draftKey());
 let gameEvents = [], lastSeatsKey = "", lastNotice = null;
 let game = -1, shown = 0, panelKey = "", countdownEl = null, deadline = 0, draftQ = "", draftSeat = "0";
 
@@ -131,13 +135,15 @@ function renderTurn(p) {
   let ta = null;
   if (p.speech) {
     ta = el("textarea", { placeholder: "输入你的发言（留空 = 过）", maxlength: "300" });
+    ta.value = getDraft();                       // 提前写好的草稿
+    ta.oninput = () => setDraft(ta.value);
     panel.appendChild(ta);
   }
   const buttons = [];
   const text = () => (ta ? ta.value : "");
   const send = async (seat) => {
     buttons.forEach(b => (b.disabled = true));
-    try { await post("/api/answer", { id: p.id, text: text(), seat }); panelKey = ""; await tick(); }
+    try { await post("/api/answer", { id: p.id, text: text(), seat }); if (p.speech) setDraft(""); panelKey = ""; await tick(); }
     catch (e) { err.textContent = "提交失败：" + e.message; buttons.forEach(b => (b.disabled = false)); }
   };
   const box = el("div", { class: "btns" });
@@ -224,6 +230,13 @@ function renderLobby(s) {
 }
 
 function renderWaiting(s) {
+  const mine = (s.seats || []).find(x => x.seat === s.me.seat);
+  if (mine && mine.alive) {
+    const ta = el("textarea", { placeholder: "✍️ 提前写发言（只有你看得到；轮到你时自动填进去）", maxlength: "300" });
+    ta.value = getDraft();
+    ta.oninput = () => setDraft(ta.value);
+    panel.appendChild(ta);
+  }
   const line = el("div", { class: "line" });
   line.appendChild(el("span", { class: "grow" }, "⏳ 等待其他玩家…"));
   const err = errLine();
@@ -292,7 +305,8 @@ async function tickOnce() {
 
   // 面板只在状态变化时重画，避免你打字到一半被清空
   if (s.notice) panelKey = "";            // 有新提示时重画面板
-  const key = JSON.stringify([st, lastNotice, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
+  const meAlive = ((s.seats || []).find(x => x.seat === s.me.seat) || {}).alive;
+  const key = JSON.stringify([st, lastNotice, meAlive, st === "idle" ? s.rooms : 0, s.room.members, s.room.size, s.room.ai_ready, s.me, s.pending && s.pending.id, game,
                              s.discuss.available, s.discuss.busy]);
   if (key !== panelKey) {
     panelKey = key;
