@@ -60,6 +60,39 @@ AI_TIMEOUT = 120  # 每次调用 AI 的最长等待秒数（正常 7-15 秒；�
 PING_TIMEOUT = 45 # 开局前检查模型是否可用的最长等待秒数
 
 
+# ---------- AI 人格：每局给上场的 AI 随机生成三个属性（0-100%）----------
+TRAITS = [
+    # (名字, 低端描述, 中间描述, 高端描述)
+    ("理性", "感性：凭直觉和第一印象判断，容易被发言的气势和情绪带动，说话带感情色彩",
+             "理性和感性兼顾：既看逻辑也凭感觉",
+             "理性：重逻辑，盯着票型、发言矛盾和身份信息推理，不轻易被情绪带走"),
+    ("好胜", "无所谓：佛系随和，不爱争论，常常跟着大家走，输赢看得很淡",
+             "好胜心中等：想赢但不会太激进",
+             "极其好胜：非常想赢，发言强势，敢冒险跳身份、带节奏，咬住怀疑对象不松口"),
+    ("诚实", "狡猾：善于伪装和误导，敢悍跳、编造身份和查验结果，好人也可能为了战术说假话",
+             "诚实度中等：必要时会隐瞒或误导，但不轻易编造",
+             "诚实：尽量不说假话；即使是狼人也倾向少说、模糊带过，而不是编造事实"),
+]
+
+
+def random_persona():
+    return {name: random.randint(0, 100) for name, *_ in TRAITS}
+
+
+def persona_text(persona):
+    """把百分比变成给 AI 看的性格描述"""
+    lines = []
+    for name, low, mid, high in TRAITS:
+        v = persona[name]
+        desc = low if v <= 33 else high if v >= 67 else mid
+        lines.append(f"- {name} {v}%：{desc}")
+    return "\n".join(lines)
+
+
+def persona_short(persona):
+    return "·".join(f"{k} {v}%" for k, v in persona.items())
+
+
 class Quit(Exception):
     """玩家选择退出游戏"""
 
@@ -87,6 +120,8 @@ class Game:
         self.players = []
         for i, (p, r) in enumerate(zip(seats, roles), start=1):
             self.players.append({**p, "seat": i, "role": r, "alive": True, "notes": [], "reasons": []})
+            if p.get("kind") != "human":                 # 只给上场的 AI 生成人格；替补接手时沿用这个座位的人格
+                self.players[-1]["persona"] = random_persona()
         self.rules = rules_text(self.n)
         self.public = []               # 所有人都能看到的公开记录
         self.antidote = self.poison = True
@@ -192,6 +227,8 @@ class Game:
             public = "\n".join(self.public)
         prompt = (
             f"{self.rules}\n\n你是 {self.label(p)}，身份：{p['role']}。\n"
+            + (f"【你的性格】（请按这个性格来玩：它决定你的发言风格和判断方式；胜负依然重要，但用你自己的方式去争取）\n"
+               f"{persona_text(p['persona'])}\n" if p.get("persona") else "") +
             f"存活玩家：{'、'.join(self.label(a) for a in self.alive())}\n\n"
             "【公开记录】\n" + (public or "（无）") + "\n\n"
             "【只有你知道的信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
@@ -298,7 +335,8 @@ class Game:
             public = "\n".join(self.public)
         prompt = (
             f"{self.rules}\n\n游戏已经结束：{self.result}\n身份揭晓：{reveal}\n"
-            f"你是 {self.real_label(p)}，身份：{p['role']}。\n\n"
+            f"你是 {self.real_label(p)}，身份：{p['role']}。\n"
+            + (f"你这局的性格：\n{persona_text(p['persona'])}\n" if p.get("persona") else "") + "\n"
             "【公开记录】\n" + (public or "（无）") + "\n\n"
             "【你在游戏中的私密信息】\n" + ("\n".join(p["notes"]) or "（无）") + "\n\n"
             "【你的思考笔记本（游戏中每一步当时记下的想法）】\n" + ("\n".join(p["reasons"]) or "（没有记录）") + "\n\n"
@@ -583,6 +621,9 @@ class Game:
         # 积分统计用：每个座位是谁（AI 的模型 / 真人的登录身份）、是否测试局
         for p in self.players:
             self.log(f"[玩家] {p['seat']}|{p['name']}|{p['kind']}|{p.get('model', '')}|{p.get('uid', '')}")
+        for p in self.players:
+            if p.get("persona"):
+                self.log(f"[人格] {p['seat']}|" + "|".join(f"{k}={v}" for k, v in p["persona"].items()))
         if self.fake:
             self.log("[模式] fake")
         for h in self.humans():
@@ -606,7 +647,9 @@ class Game:
         except (KeyboardInterrupt, EOFError):
             self.result = "游戏中途被中断"
             self.say("\n游戏被中断。")
-        self.emit("身份揭晓：\n" + "\n".join(f"   {self.real_label(p)}：{p['role']}" for p in self.players), "reveal")
+        self.emit("身份揭晓：\n" + "\n".join(
+            f"   {self.real_label(p)}：{p['role']}" + (f"（{persona_short(p['persona'])}）" if p.get("persona") else "")
+            for p in self.players), "reveal")
         self.emit(f"完整记录（含所有私密信息）：{self.logfile}", "logpath")
 
 
