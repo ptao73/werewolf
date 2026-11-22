@@ -57,5 +57,8 @@ Terminal: `python3 werewolf.py --size 8`.
 
 ## AI personalities
 Each AI that plays gets three random traits per game (0-100%, U-shaped: extremes are common): 理性 (emotional ↔ rational),
-好胜 (easy-going ↔ extremely competitive), 诚实 (cunning ↔ honest). They shape how the AI talks and decides.
+好胜 (easy-going ↔ extremely competitive), 诚实 (cunning ↔ honest). They shape how the AI talks and how it decides:
+for every choice (vote, night action, hunter shot) the AI scores each seat on logic / gut / crowd (0-10),
+and the program combines the scores with the AI's own weights — 理性 sets logic vs. gut, low 好胜 adds
+weight to the crowd and needs stronger conviction before acting on optional choices (vote, poison, shot).
 Traits are hidden during the game (showing them would reveal which seats are AIs) and revealed with the roles at the end.

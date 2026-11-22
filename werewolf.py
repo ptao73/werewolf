@@ -231,7 +231,9 @@ class Game:
             public = "\n".join(self.public)
         prompt = (
             f"{self.rules}\n\n你是 {self.label(p)}，身份：{p['role']}。\n"
-            + (f"【你的性格】（请按这个性格来玩：它决定你的发言风格和判断方式；胜负依然重要，但用你自己的方式去争取）\n"
+            + (f"【你的性格】（请按这个性格来玩：它既决定你的发言风格，也决定你判断时看重什么——"
+               f"理性高就重证据、感性高就重直觉；好胜高就敢冒险出手、好胜低就随大流、没把握就不出手；"
+               f"诚实决定你会不会编造。胜负依然重要，但用你自己的方式去争取）\n"
                f"{persona_text(p['persona'])}\n" if p.get("persona") else "") +
             f"存活玩家：{'、'.join(self.label(a) for a in self.alive())}\n\n"
             "【公开记录】\n" + (public or "（无）") + "\n\n"
@@ -242,6 +244,12 @@ class Game:
         )
         fmt = {"speech": "你的发言" if speech else "", "target": "座位号数字" if valid else 0,
                "thinking": "你的思考笔记（只有你自己看得到，不公开）：你目前对其他玩家的判断、这样做的理由、接下来的打算，不超过150字"}
+        weighted = bool(valid and p.get("persona"))
+        if weighted:
+            fmt["scores"] = {str(valid[0]): ["logic", "gut", "crowd"], "…": "每个可选座位一项"}
+            prompt += ("给每个可选座位打三个分（0-10 的数字）：logic=按证据和推理你有多想选他；gut=凭直觉和印象有多想选他；"
+                       "crowd=场上其他人有多倾向他。系统会按你的性格把这些分数合成最终决定"
+                       + ("；如果这件事可以不选，分数都不够高时就会不选" if allow_none else "") + "。target 写你自己最想选的。\n")
         if valid:
             prompt += f"target 只能是 {valid}" + ("，或 0 表示不选" if allow_none else "") + "。\n"
         prompt += f"不要运行任何命令或工具，只用一行 JSON 回复，格式：{json.dumps(fmt, ensure_ascii=False)}"
@@ -251,12 +259,22 @@ class Game:
             data = self.parse_json(raw)
             ok_t = (not valid) or (data and str(data.get("target")).isdigit()
                                    and (int(data["target"]) in valid or (allow_none and int(data["target"]) == 0)))
-            if data is not None and ok_t:
-                t = int(data.get("target") or 0) if valid else 0
+            picked = self.personality_pick(p, data.get("scores"), valid, allow_none) \
+                if (weighted and isinstance(data, dict)) else None
+            if data is not None and (ok_t or picked):
+                own = int(data["target"]) if ok_t and valid else 0      # AI 自己想选的
+                t = picked[0] if picked else own                       # 按性格权重算出的最终选择
                 thinking = str(data.get("thinking") or data.get("reason") or "").strip()[:400]
                 when = f"第{self.day}{'夜' if self.night_now else '天'}"
                 act = f"选了 {t}号" if t else ("不选" if valid else "发言")
-                self.write_note(p, f"{when}｜{task}｜{act}\n  思考：{thinking or '（没写）'}")
+                note = f"{when}｜{task}｜{act}\n  思考：{thinking or '（没写）'}"
+                if picked:
+                    finals, thr = picked[1], picked[2]
+                    top = "、".join(f"{s_}号 {v:.1f}" for s_, v in sorted(finals.items(), key=lambda x: -x[1])[:3])
+                    note += f"\n  性格加权：得分前三 {top}" + (f"；门槛 {thr:.1f}" if allow_none else "")
+                    if t != own:
+                        note += f"；你原本想选 {own or '不选'}{'号' if own else ''}，按性格最终 {act}"
+                self.write_note(p, note)
                 return str(data.get("speech", "")).strip(), t
             self.log(f"[无效回复 {self.real_label(p)}] {raw[:300]}")
             prompt += "\n（上次回复格式无效，请严格按 JSON 格式重新回复。）"
@@ -358,6 +376,32 @@ class Game:
         self.log(f"[赛后讨论] {asker} 问 {self.real_label(p)}：{question}\n  回答：{ans}")
         return ans
 
+    def personality_pick(self, p, scores, valid, allow_none):
+        """按性格把 AI 的打分合成最终选择。返回 (座位号或0, 各座位得分, 门槛)；分数不完整返回 None
+        - 理性：logic 和 gut 的比例（理性 90% = 90% 看证据、10% 看直觉）
+        - 好胜：越不好胜越跟随大家（crowd 加分），而且可以不选的事需要更强的把握才出手"""
+        if not isinstance(scores, dict):
+            return None
+        r, h = p["persona"]["理性"] / 100, p["persona"]["好胜"] / 100
+        finals = {}
+        for seat in valid:
+            v = scores.get(str(seat), scores.get(seat))
+            try:                      # 有的模型把分数写成文字 "7"，也接受
+                nums = [float(x) for x in v] if isinstance(v, list) and len(v) == 3 else None
+            except (TypeError, ValueError):
+                nums = None
+            if nums:
+                logic, gut, crowd = (max(0.0, min(10.0, x)) for x in nums)
+                finals[seat] = r * logic + (1 - r) * gut + (1 - h) * 0.5 * crowd
+        if not finals or len(finals) < (len(valid) + 1) // 2:     # 打分太不完整，就不用
+            return None
+        best = max(finals.values())
+        pick = random.choice([s_ for s_, v in finals.items() if abs(v - best) < 1e-9])
+        thr = 7.5 - 5 * h          # 好胜 100% → 2.5 分就出手；0% → 要 7.5 分
+        if allow_none and best < thr:
+            return 0, finals, thr
+        return pick, finals, thr
+
     def write_note(self, p, entry):
         """把一条思考记进该座位的笔记本（内存里一份，文件里一份）"""
         p["reasons"].append(entry)
@@ -407,12 +451,21 @@ class Game:
     @staticmethod
     def parse_json(raw):
         """从回复里找出最后一个 {...} 并解析"""
-        for m in reversed(re.findall(r"\{.*?\}", raw or "", re.S)):
+        raw = raw or ""
+        dec = json.JSONDecoder()
+        found = None
+        for i, ch in enumerate(raw):            # 从每个 "{" 尝试解析出完整的 JSON（支持嵌套）
+            if ch != "{":
+                continue
             try:
-                return json.loads(m)
+                obj, _ = dec.raw_decode(raw[i:])
             except json.JSONDecodeError:
                 continue
-        return None
+            if isinstance(obj, dict) and (found is None or not (set(found) & {"speech", "target", "scores", "ok"})):
+                found = obj
+                if set(obj) & {"speech", "target", "scores", "ok"}:
+                    break
+        return found
 
     # ---------- 游戏流程 ----------
     def winner(self):
