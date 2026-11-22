@@ -761,7 +761,14 @@ class Handler(BaseHTTPRequestHandler):
             import stats
             return self.reply(200, {"sizes": {n: w.rules_text(n) for n in SIZES},
                                     "roles": {n: w.ROLESETS[n] for n in SIZES},
-                                    "turn_seconds": TURN_SECONDS, "points": stats.POINTS, "labels": stats.LABELS})
+                                    "turn_seconds": TURN_SECONDS, "points": stats.POINTS, "labels": stats.LABELS,
+                                    "ai": w.persona_rules_text(),
+                                    "rooms": (f"· 同时最多 {Hub.MAX_ROOMS} 个房间；每人同一时间只能在一个房间里。\n"
+                                              f"· 房主离开 = 房间解散。等人的房间 {Hub.IDLE_SECONDS // 60} 分钟没人操作，"
+                                              f"或所有人的页面都关了 {Hub.GONE_SECONDS // 60} 分钟，会自动关闭；游戏进行中的房间不会被自动关闭。\n"
+                                              f"· 朋友当房主开的局每天合计最多 {Access_List.DAILY_LIMIT} 局。\n"
+                                              "· 顶部座位栏：点座位号可以看他这局说过的话。\n"
+                                              "· 一局结束后，可以在下方“赛后问 AI”里问 AI 当时是怎么想的。")})
         if u.path == "/api/state":
             q = parse_qs(u.query)
             try:

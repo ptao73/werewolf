@@ -377,12 +377,15 @@ document.getElementById("rulesBtn").onclick = async () => {
   overlay.appendChild(el("div", { class: "rtext" },
     "· 每局由房主选人数；空位由 AI 补上。游戏中大家都只显示座位号，结束后公布每个座位是谁、是什么身份。\n" +
     "· 夜里：守卫、狼人、预言家同时行动，然后女巫行动。白天：公布死讯 → 依次发言 → 所有人同时投票。\n" +
-    `· 真人每次行动限时 ${r.turn_seconds} 秒，超时自动处理：发言记为“过”，投票记为弃票，必须选人的随机选。\n` +
-    "· 结束后可以在下方“赛后问 AI”里问 AI 当时是怎么想的。"));
+    `· 真人每次行动限时 ${r.turn_seconds} 秒，超时自动处理：发言记为“过”，投票记为弃票，必须选人的随机选。`));
   for (const [n, text] of Object.entries(r.sizes)) {
     overlay.appendChild(el("h3", {}, `${n} 人局`));
     overlay.appendChild(el("div", { class: "rtext" }, text.split("\n").slice(1, -1).join("\n")));
   }
+  overlay.appendChild(el("h3", {}, "🤖 AI 玩家的性格"));
+  overlay.appendChild(el("div", { class: "rtext" }, r.ai));
+  overlay.appendChild(el("h3", {}, "🏠 房间与开局"));
+  overlay.appendChild(el("div", { class: "rtext" }, r.rooms));
   overlay.appendChild(el("h3", {}, "🏆 积分"));
   const pts = Object.entries(r.points).map(([k, v]) => `${r.labels[k]} ${v > 0 ? "+" : ""}${v}`).join("，");
   overlay.appendChild(el("div", { class: "rtext" }, "胜利 +10；" + pts + "。只统计打完的真实对局。"));

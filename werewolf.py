@@ -93,6 +93,22 @@ def persona_text(persona):
     return "\n".join(lines)
 
 
+def persona_rules_text():
+    """规则页里"AI 性格"一节（直接用游戏实际使用的设定生成，改设定规则页会跟着变）"""
+    lines = ["每局开始时，每个上场的 AI 随机得到三个性格属性（0-100%）。两头的值更常见（约八成落在偏低或偏高的一端），性格更鲜明。"]
+    for name, low, _mid, high in TRAITS:
+        lines.append(f"· {name}：低 = {low.split('：')[0]}，高 = {high.split('：')[0]}")
+    lines += [
+        "性格不只影响说话风格，也影响判断：每次要选人（投票、夜间行动、猎人开枪）时，AI 给每个座位打三个分——"
+        "证据推理分、直觉印象分、跟随大家分；程序再按它的性格合成最终选择：",
+        "· 理性越高越看证据，越低越凭直觉；",
+        "· 好胜越低越容易跟着大家走，而且可以不选的事（投票、毒药、开枪）没有足够把握就不出手；越好胜越敢在证据不足时出手；",
+        "· 诚实决定它会不会编造身份和查验结果。",
+        "性格在游戏中保密（否则大家就知道哪些座位是 AI），结束后和身份一起公布。真人玩家没有性格设定。",
+    ]
+    return "\n".join(lines)
+
+
 def persona_short(persona):
     return "·".join(f"{k} {v}%" for k, v in persona.items())
 
